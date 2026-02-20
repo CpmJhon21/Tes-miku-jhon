@@ -1,5 +1,3 @@
-# Tes-miku-jhon
-
 # 📧 JHON Temp Mail - Premium Source Code
 
 Aplikasi Temporary Email (Email Sementara) modern berbasis Web & PWA dengan tampilan profesional, fitur inbox real-time, dan dokumentasi lengkap.

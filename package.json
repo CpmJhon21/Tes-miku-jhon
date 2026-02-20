@@ -1,0 +1,10 @@
+{
+  "name": "temp-mail-vercel",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node api/index.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12"
+  }
+}
