@@ -1481,7 +1481,26 @@ function shareToWaText() {
         const modalFrom = document.querySelector('.meta-from')?.innerText || 'Unknown';
         const modalTime = document.querySelector('.meta-time')?.innerText || '';
         
-        const text = `*${modalSubject}*\n\n📧 *Dari:* ${modalFrom}\n⏰ *Waktu:* ${modalTime}\n\n📝 *Pesan:*\n${modalBody}\n\n━━━━━━━━━━━━━━\n_Dikirim via TempMail - JHON FORUM_`;
+        const text = `📊 *Jhon-TempMail*
+════════════════════
+         *PESAN TERKIRIM*
+════════════════════
+📨 *Pesan diterima:*
+ `${modalSubject}`
+════════════════════
+📧 *Email Dari:*
+ `${modalFrom}`
+════════════════════
+⏱️ *Waktu:* 
+`${modalTime}`
+════════════════════
+🗓️ *Tanggal bulan tahun:* 
+`${new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}`
+════════════════════
+💾 *Dikirim via:* `TempMail - JHON FORUM`
+════════════════════
+> Developer: `JHON PRODUCTION`
+════════════════════`;
         
         const waUrl = `https://wa.me/?text=${encodeURIComponent(text)}`;
         window.open(waUrl, '_blank');
