@@ -1,19 +1,17 @@
 // ========== KONFIGURASI ==========
 const CONFIG = {
     DB_NAME: 'jhonMailDB',
-    DB_VERSION: 3, // Upgrade ke versi 3
+    DB_VERSION: 4, // Upgrade ke versi 4
     STORE_NAME: 'messages',
     STORE_ACCOUNTS: 'accounts',
     STORE_SETTINGS: 'settings',
+    STORE_DELETED: 'deleted', // Store baru untuk menyimpan ID yang dihapus
     REFRESH_INTERVAL: 10,
     REQUEST_TIMEOUT: 10000,
     MAX_RETRY: 3,
     DEBUG: true,
-    VIRTUAL_SCROLL_ITEM_HEIGHT: 90,
-    VIRTUAL_SCROLL_BUFFER: 5,
     PAGINATION_PAGE_SIZE: 20,
-    SYNC_INTERVAL: 30000,
-    MAX_STORAGE_SIZE: 50 * 1024 * 1024
+    SYNC_INTERVAL: 30000
 };
 
 // ========== STATE MANAGEMENT ==========
@@ -37,10 +35,10 @@ let totalPages = {
     inbox: 1,
     updates: 1
 };
-let syncInterval = null;
 let currentAccount = localStorage.getItem('jhon_current_account') || 'default';
 let accounts = JSON.parse(localStorage.getItem('jhon_accounts') || '{"default": {"name": "Default", "email": null}}');
 let starredMessages = new Set(JSON.parse(localStorage.getItem('jhon_starred') || '[]'));
+let deletedMessages = new Set(JSON.parse(localStorage.getItem('jhon_deleted') || '[]')); // Track pesan yang dihapus
 let darkMode = localStorage.getItem('jhon_darkmode') === 'true';
 let analytics = {
     messagesReceived: 0,
@@ -48,14 +46,6 @@ let analytics = {
     emailsGenerated: 0,
     lastSync: null,
     storageUsed: 0
-};
-
-// Cache untuk menyimpan pesan yang sudah difilter
-let cachedMessages = {
-    all: [],
-    filtered: [],
-    unread: [],
-    read: []
 };
 
 // ========== CLASS MessageDB ==========
@@ -74,25 +64,27 @@ class MessageDB {
                 request.onupgradeneeded = (e) => {
                     const db = e.target.result;
                     
-                    // Hapus store lama jika ada
-                    if (db.objectStoreNames.contains(this.storeName)) {
-                        db.deleteObjectStore(this.storeName);
+                    // Messages store
+                    if (!db.objectStoreNames.contains(this.storeName)) {
+                        const messageStore = db.createObjectStore(this.storeName, { keyPath: 'id' });
+                        messageStore.createIndex('account', 'account', { unique: false });
+                        messageStore.createIndex('created', 'created', { unique: false });
+                        messageStore.createIndex('isRead', 'isRead', { unique: false });
                     }
                     
-                    // Buat store baru dengan struktur yang benar
-                    const messageStore = db.createObjectStore(this.storeName, { keyPath: 'id' });
-                    messageStore.createIndex('account', 'account', { unique: false });
-                    messageStore.createIndex('created', 'created', { unique: false });
-                    messageStore.createIndex('isRead', 'isRead', { unique: false });
-                    messageStore.createIndex('starred', 'starred', { unique: false });
-                    
+                    // Accounts store
                     if (!db.objectStoreNames.contains(CONFIG.STORE_ACCOUNTS)) {
-                        const accountStore = db.createObjectStore(CONFIG.STORE_ACCOUNTS, { keyPath: 'id' });
-                        accountStore.createIndex('email', 'email', { unique: true });
+                        db.createObjectStore(CONFIG.STORE_ACCOUNTS, { keyPath: 'id' });
                     }
                     
+                    // Settings store
                     if (!db.objectStoreNames.contains(CONFIG.STORE_SETTINGS)) {
                         db.createObjectStore(CONFIG.STORE_SETTINGS);
+                    }
+                    
+                    // Deleted store untuk tracking pesan yang dihapus
+                    if (!db.objectStoreNames.contains(CONFIG.STORE_DELETED)) {
+                        db.createObjectStore(CONFIG.STORE_DELETED, { keyPath: 'id' });
                     }
                     
                     log('Database upgraded to version', CONFIG.DB_VERSION);
@@ -139,7 +131,6 @@ class MessageDB {
                 const tx = this.db.transaction(this.storeName, 'readwrite');
                 const store = tx.objectStore(this.storeName);
                 
-                // Pastikan semua field ada
                 const messageToSave = {
                     id: message.id,
                     from: message.from || 'Unknown',
@@ -147,15 +138,13 @@ class MessageDB {
                     message: message.message || '(Kosong)',
                     created: message.created || new Date().toISOString(),
                     isRead: message.isRead || false,
-                    account: currentAccount,
-                    starred: starredMessages.has(message.id)
+                    account: currentAccount
                 };
                 
                 const request = store.put(messageToSave);
                 
                 request.onsuccess = () => {
                     log('Message saved:', message.id);
-                    this.updateAnalytics();
                     resolve();
                 };
                 
@@ -182,8 +171,10 @@ class MessageDB {
                 request.onsuccess = () => {
                     let messages = request.result || [];
                     
-                    // Filter by account
-                    messages = messages.filter(m => m.account === accountId);
+                    // Filter by account dan exclude deleted messages
+                    messages = messages.filter(m => 
+                        m.account === accountId && !deletedMessages.has(m.id)
+                    );
                     
                     // Sort by created date descending
                     messages.sort((a, b) => {
@@ -191,11 +182,6 @@ class MessageDB {
                         const dateB = new Date(b.created || 0);
                         return dateB - dateA;
                     });
-                    
-                    // Update cache
-                    cachedMessages.all = messages;
-                    cachedMessages.unread = messages.filter(m => !m.isRead);
-                    cachedMessages.read = messages.filter(m => m.isRead);
                     
                     resolve(messages);
                 };
@@ -297,44 +283,6 @@ class MessageDB {
         }
     }
 
-    async clear() {
-        try {
-            await this.ensureConnection();
-            
-            return new Promise((resolve, reject) => {
-                const tx = this.db.transaction(this.storeName, 'readwrite');
-                const store = tx.objectStore(this.storeName);
-                
-                const request = store.openCursor();
-                request.onsuccess = (e) => {
-                    const cursor = e.target.result;
-                    if (cursor) {
-                        if (cursor.value.account === currentAccount) {
-                            cursor.delete();
-                        }
-                        cursor.continue();
-                    } else {
-                        // Clear cache
-                        cachedMessages = {
-                            all: [],
-                            filtered: [],
-                            unread: [],
-                            read: []
-                        };
-                        resolve();
-                    }
-                };
-                
-                request.onerror = (e) => {
-                    reject(new Error('Failed to clear database: ' + e.target.error));
-                };
-            });
-        } catch (e) {
-            log('Clear error:', e);
-            throw e;
-        }
-    }
-
     async delete(id) {
         try {
             await this.ensureConnection();
@@ -345,15 +293,17 @@ class MessageDB {
                 const request = store.delete(id);
                 
                 request.onsuccess = () => {
-                    starredMessages.delete(id);
-                    localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+                    // Tambahkan ke daftar pesan yang dihapus
+                    deletedMessages.add(id);
+                    localStorage.setItem('jhon_deleted', JSON.stringify([...deletedMessages]));
                     
-                    // Update cache
-                    cachedMessages.all = cachedMessages.all.filter(m => m.id !== id);
-                    cachedMessages.unread = cachedMessages.unread.filter(m => m.id !== id);
-                    cachedMessages.read = cachedMessages.read.filter(m => m.id !== id);
+                    // Hapus dari starred jika ada
+                    if (starredMessages.has(id)) {
+                        starredMessages.delete(id);
+                        localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+                    }
                     
-                    log('Message deleted:', id);
+                    log('Message deleted permanently:', id);
                     resolve();
                 };
                 
@@ -381,17 +331,21 @@ class MessageDB {
                     const cursor = e.target.result;
                     if (cursor) {
                         if (cursor.value.account === currentAccount && cursor.value.isRead) {
-                            starredMessages.delete(cursor.value.id);
+                            // Tambahkan ke daftar pesan yang dihapus
+                            deletedMessages.add(cursor.value.id);
+                            
+                            // Hapus dari starred jika ada
+                            if (starredMessages.has(cursor.value.id)) {
+                                starredMessages.delete(cursor.value.id);
+                            }
+                            
                             cursor.delete();
                         }
                         cursor.continue();
                     } else {
+                        // Simpan ke localStorage
+                        localStorage.setItem('jhon_deleted', JSON.stringify([...deletedMessages]));
                         localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
-                        
-                        // Update cache
-                        cachedMessages.all = cachedMessages.all.filter(m => !m.isRead);
-                        cachedMessages.read = [];
-                        cachedMessages.unread = cachedMessages.all.filter(m => !m.isRead);
                         
                         resolve();
                     }
@@ -407,23 +361,45 @@ class MessageDB {
         }
     }
 
-    async updateAnalytics() {
+    async clear() {
         try {
-            const messages = await this.getAll();
-            analytics.messagesReceived = messages.length;
-            analytics.messagesRead = messages.filter(m => m.isRead).length;
+            await this.ensureConnection();
             
-            const serialized = JSON.stringify(messages);
-            analytics.storageUsed = new Blob([serialized]).size;
-            
-            this.saveAnalytics();
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(this.storeName, 'readwrite');
+                const store = tx.objectStore(this.storeName);
+                
+                const request = store.openCursor();
+                request.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        if (cursor.value.account === currentAccount) {
+                            // Tambahkan semua ke daftar pesan yang dihapus
+                            deletedMessages.add(cursor.value.id);
+                            
+                            // Hapus dari starred
+                            if (starredMessages.has(cursor.value.id)) {
+                                starredMessages.delete(cursor.value.id);
+                            }
+                            
+                            cursor.delete();
+                        }
+                        cursor.continue();
+                    } else {
+                        localStorage.setItem('jhon_deleted', JSON.stringify([...deletedMessages]));
+                        localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+                        resolve();
+                    }
+                };
+                
+                request.onerror = (e) => {
+                    reject(new Error('Failed to clear database: ' + e.target.error));
+                };
+            });
         } catch (e) {
-            log('Update analytics error:', e);
+            log('Clear error:', e);
+            throw e;
         }
-    }
-
-    saveAnalytics() {
-        localStorage.setItem('jhon_analytics', JSON.stringify(analytics));
     }
 }
 
@@ -498,13 +474,6 @@ function closeModal(modalId) {
     }
 }
 
-function closeAllModals() {
-    document.querySelectorAll('.modal.show').forEach(modal => {
-        modal.classList.remove('show');
-    });
-    document.body.classList.remove('modal-open');
-}
-
 function showConfirm(title, message, onConfirm) {
     const modal = document.getElementById('confirmModal');
     document.getElementById('confirmTitle').innerText = title;
@@ -575,533 +544,6 @@ function escapeString(str) {
     return div.innerHTML;
 }
 
-// ========== SYNC FUNCTIONS ==========
-function initSync() {
-    if (syncInterval) {
-        clearInterval(syncInterval);
-    }
-    
-    syncInterval = setInterval(async () => {
-        await syncWithOtherTabs();
-    }, CONFIG.SYNC_INTERVAL);
-    
-    window.addEventListener('storage', (e) => {
-        if (e.key === 'jhon_sync_trigger') {
-            handleSyncFromOtherTab();
-        }
-    });
-}
-
-async function syncWithOtherTabs() {
-    try {
-        const messages = await messageDB.getAll();
-        const data = {
-            timestamp: Date.now(),
-            messages: messages,
-            accounts: accounts,
-            currentAccount: currentAccount,
-            starred: [...starredMessages]
-        };
-        
-        localStorage.setItem('jhon_sync_data', JSON.stringify(data));
-        localStorage.setItem('jhon_sync_trigger', Date.now().toString());
-        
-        analytics.lastSync = new Date().toISOString();
-        messageDB.saveAnalytics();
-    } catch (e) {
-        log('Sync error:', e);
-    }
-}
-
-async function handleSyncFromOtherTab() {
-    try {
-        const syncData = localStorage.getItem('jhon_sync_data');
-        if (!syncData) return;
-        
-        const data = JSON.parse(syncData);
-        
-        if (data.timestamp > (analytics.lastSync ? new Date(analytics.lastSync).getTime() : 0)) {
-            accounts = data.accounts;
-            localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
-            
-            if (data.currentAccount !== currentAccount) {
-                currentAccount = data.currentAccount;
-                localStorage.setItem('jhon_current_account', currentAccount);
-                await loadCachedMessages();
-            }
-            
-            starredMessages = new Set(data.starred);
-            localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
-        }
-    } catch (e) {
-        log('Sync handling error:', e);
-    }
-}
-
-// ========== BACKUP & RESTORE ==========
-async function exportBackup() {
-    try {
-        showGlobalLoading(true);
-        
-        const messages = await messageDB.getAll();
-        const backup = {
-            version: CONFIG.DB_VERSION,
-            timestamp: new Date().toISOString(),
-            data: {
-                messages: messages,
-                accounts: accounts,
-                starred: [...starredMessages],
-                analytics: analytics,
-                settings: {
-                    darkMode: darkMode,
-                    refreshInterval: CONFIG.REFRESH_INTERVAL
-                }
-            }
-        };
-        
-        const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `tempmail-backup-${new Date().toISOString().split('T')[0]}.json`;
-        a.click();
-        
-        URL.revokeObjectURL(url);
-        showToast('Backup berhasil dibuat', 'success');
-        closeModal('backupModal');
-    } catch (e) {
-        log('Export backup error:', e);
-        showToast('Gagal membuat backup', 'error');
-    } finally {
-        showGlobalLoading(false);
-    }
-}
-
-async function importBackup(input) {
-    const file = input.files[0];
-    if (!file) return;
-    
-    try {
-        showGlobalLoading(true);
-        
-        const text = await file.text();
-        const backup = JSON.parse(text);
-        
-        if (!backup.version || !backup.data) {
-            throw new Error('Format backup tidak valid');
-        }
-        
-        if (backup.data.messages) {
-            await messageDB.clear();
-            for (const msg of backup.data.messages) {
-                await messageDB.save(msg);
-            }
-        }
-        
-        if (backup.data.accounts) {
-            accounts = backup.data.accounts;
-            localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
-        }
-        
-        if (backup.data.starred) {
-            starredMessages = new Set(backup.data.starred);
-            localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
-        }
-        
-        if (backup.data.settings) {
-            darkMode = backup.data.settings.darkMode;
-            if (darkMode) document.body.classList.add('dark-mode');
-            else document.body.classList.remove('dark-mode');
-            localStorage.setItem('jhon_darkmode', darkMode);
-        }
-        
-        await loadCachedMessages();
-        showToast('Backup berhasil direstore', 'success');
-        closeModal('backupModal');
-    } catch (e) {
-        log('Import backup error:', e);
-        showToast('Gagal merestore backup: ' + e.message, 'error');
-    } finally {
-        showGlobalLoading(false);
-        input.value = '';
-    }
-}
-
-function showBackupModal() {
-    const totalMsg = document.getElementById('backupTotalMsg');
-    const backupSize = document.getElementById('backupSize');
-    
-    totalMsg.textContent = analytics.messagesReceived || 0;
-    
-    const size = analytics.storageUsed || 0;
-    if (size < 1024) {
-        backupSize.textContent = size + ' B';
-    } else if (size < 1024 * 1024) {
-        backupSize.textContent = (size / 1024).toFixed(2) + ' KB';
-    } else {
-        backupSize.textContent = (size / (1024 * 1024)).toFixed(2) + ' MB';
-    }
-    
-    openModal('backupModal');
-}
-
-// ========== MULTIPLE ACCOUNTS ==========
-async function switchAccount(accountId) {
-    currentAccount = accountId;
-    localStorage.setItem('jhon_current_account', accountId);
-    
-    currentEmail = accounts[accountId].email;
-    if (currentEmail) {
-        localStorage.setItem('jhon_mail', currentEmail);
-        document.getElementById('emailAddress').innerText = currentEmail;
-    }
-    
-    await loadCachedMessages();
-    showToast(`Beralih ke ${accounts[accountId].name}`, 'success');
-    closeModal('accountsModal');
-}
-
-function showAccountsModal() {
-    const accountsList = document.getElementById('accountsList');
-    let html = '';
-    
-    Object.keys(accounts).forEach(accountId => {
-        const account = accounts[accountId];
-        const isActive = accountId === currentAccount;
-        
-        html += `
-            <div class="account-item ${isActive ? 'active' : ''}" onclick="switchAccount('${accountId}')">
-                <div class="account-avatar">${account.name.charAt(0).toUpperCase()}</div>
-                <div class="account-info">
-                    <div class="account-name">${account.name}</div>
-                    <div class="account-email">${account.email || 'Belum ada email'}</div>
-                </div>
-                ${isActive ? '<i class="bi bi-check-circle-fill account-check"></i>' : ''}
-            </div>
-        `;
-    });
-    
-    accountsList.innerHTML = html || '<div class="empty-placeholder">Belum ada account</div>';
-    openModal('accountsModal');
-}
-
-function showAddAccountModal() {
-    document.getElementById('newAccountName').value = '';
-    document.getElementById('newAccountEmail').value = '';
-    openModal('addAccountModal');
-}
-
-async function addNewAccount() {
-    const name = document.getElementById('newAccountName').value.trim();
-    const email = document.getElementById('newAccountEmail').value.trim();
-    
-    if (!name) {
-        showToast('Nama account harus diisi', 'error');
-        return;
-    }
-    
-    const accountId = 'account_' + Date.now();
-    
-    accounts[accountId] = {
-        name: name,
-        email: email || null
-    };
-    
-    localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
-    
-    if (email) {
-        currentEmail = email;
-        currentAccount = accountId;
-        localStorage.setItem('jhon_mail', email);
-        localStorage.setItem('jhon_current_account', accountId);
-        document.getElementById('emailAddress').innerText = email;
-        await loadCachedMessages();
-    }
-    
-    closeModal('addAccountModal');
-    showAccountsModal();
-    showToast('Account berhasil ditambahkan', 'success');
-}
-
-// ========== DARK MODE ==========
-function toggleDarkMode() {
-    darkMode = !darkMode;
-    
-    if (darkMode) {
-        document.body.classList.add('dark-mode');
-    } else {
-        document.body.classList.remove('dark-mode');
-    }
-    
-    localStorage.setItem('jhon_darkmode', darkMode);
-    showToast(darkMode ? 'Dark mode aktif' : 'Light mode aktif', 'success');
-}
-
-// ========== FILTER FUNCTIONS ==========
-function showFilterModal() {
-    // Set active status chip
-    document.querySelectorAll('.filter-chip').forEach(chip => {
-        if (chip.dataset.status === currentFilter.status) {
-            chip.classList.add('active');
-        } else {
-            chip.classList.remove('active');
-        }
-    });
-    
-    // Set date select
-    const dateSelect = document.getElementById('filterDate');
-    dateSelect.value = currentFilter.date;
-    
-    // Set search input
-    document.getElementById('filterSearch').value = currentFilter.search || '';
-    
-    // Set custom date inputs
-    document.getElementById('filterDateFrom').value = currentFilter.dateFrom || '';
-    document.getElementById('filterDateTo').value = currentFilter.dateTo || '';
-    
-    // Show/hide custom date range
-    document.getElementById('customDateRange').style.display = 
-        currentFilter.date === 'custom' ? 'block' : 'none';
-    
-    openModal('filterModal');
-}
-
-async function applyFilter() {
-    // Get status from active chip
-    const activeChip = document.querySelector('.filter-chip.active');
-    currentFilter.status = activeChip ? activeChip.dataset.status : 'all';
-    
-    // Get date
-    currentFilter.date = document.getElementById('filterDate').value;
-    
-    // Get custom dates
-    if (currentFilter.date === 'custom') {
-        currentFilter.dateFrom = document.getElementById('filterDateFrom').value;
-        currentFilter.dateTo = document.getElementById('filterDateTo').value;
-    } else {
-        currentFilter.dateFrom = null;
-        currentFilter.dateTo = null;
-    }
-    
-    // Get search
-    currentFilter.search = document.getElementById('filterSearch').value;
-    
-    closeModal('filterModal');
-    
-    // Reset ke halaman 1
-    currentPage.inbox = 1;
-    currentPage.updates = 1;
-    
-    await loadCachedMessages();
-    showToast('Filter diterapkan', 'success');
-}
-
-function resetFilter() {
-    currentFilter = {
-        status: 'all',
-        date: 'all',
-        search: '',
-        dateFrom: null,
-        dateTo: null
-    };
-    
-    closeModal('filterModal');
-    
-    // Reset UI chips
-    document.querySelectorAll('.filter-chip').forEach(chip => {
-        if (chip.dataset.status === 'all') {
-            chip.classList.add('active');
-        } else {
-            chip.classList.remove('active');
-        }
-    });
-    
-    document.getElementById('filterDate').value = 'all';
-    document.getElementById('filterSearch').value = '';
-    document.getElementById('customDateRange').style.display = 'none';
-    
-    // Reset ke halaman 1
-    currentPage.inbox = 1;
-    currentPage.updates = 1;
-    
-    loadCachedMessages();
-    showToast('Filter direset', 'success');
-}
-
-// ========== MARK ALL AS READ ==========
-async function markAllAsRead() {
-    try {
-        showGlobalLoading(true);
-        
-        const messages = await messageDB.getAll();
-        const unreadMessages = messages.filter(m => !m.isRead);
-        
-        for (const msg of unreadMessages) {
-            msg.isRead = true;
-            await messageDB.save(msg);
-        }
-        
-        await loadCachedMessages();
-        showToast('Semua pesan ditandai telah dibaca', 'success');
-    } catch (e) {
-        log('Mark all as read error:', e);
-        showToast('Gagal menandai pesan', 'error');
-    } finally {
-        showGlobalLoading(false);
-    }
-}
-
-// ========== STARRED MESSAGES ==========
-async function toggleStarred(msgId) {
-    try {
-        if (starredMessages.has(msgId)) {
-            starredMessages.delete(msgId);
-            showToast('Dihapus dari favorit', 'info');
-        } else {
-            starredMessages.add(msgId);
-            showToast('Ditambahkan ke favorit', 'success');
-        }
-        
-        localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
-        
-        const msg = await messageDB.getById(msgId);
-        if (msg) {
-            msg.starred = starredMessages.has(msgId);
-            await messageDB.save(msg);
-        }
-        
-        await loadCachedMessages();
-    } catch (e) {
-        log('Toggle starred error:', e);
-        showToast('Gagal mengupdate favorit', 'error');
-    }
-}
-
-// ========== KEYBOARD SHORTCUTS ==========
-function setupKeyboardShortcuts() {
-    document.addEventListener('keydown', (e) => {
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
-            return;
-        }
-        
-        const key = e.key.toLowerCase();
-        
-        switch(key) {
-            case 'g':
-                e.preventDefault();
-                confirmNewEmail();
-                break;
-            case 'r':
-                e.preventDefault();
-                fetchInbox();
-                break;
-            case 'c':
-                e.preventDefault();
-                copyEmail();
-                break;
-            case 'f':
-                e.preventDefault();
-                showFilterModal();
-                break;
-            case '/':
-                e.preventDefault();
-                document.getElementById('filterSearch')?.focus();
-                break;
-            case 'm':
-                e.preventDefault();
-                markAllAsRead();
-                break;
-            case 'd':
-                e.preventDefault();
-                toggleDarkMode();
-                break;
-            case '1':
-                e.preventDefault();
-                switchTab('view-home', document.querySelector('.nav-item:first-child'));
-                break;
-            case '2':
-                e.preventDefault();
-                switchTab('view-inbox', document.querySelectorAll('.nav-item')[1]);
-                break;
-            case '3':
-                e.preventDefault();
-                switchTab('view-updates', document.querySelectorAll('.nav-item')[3]);
-                break;
-            case '4':
-                e.preventDefault();
-                switchTab('view-docs', document.querySelectorAll('.nav-item')[4]);
-                break;
-            case '?':
-                e.preventDefault();
-                showShortcutsModal();
-                break;
-            case 'escape':
-                closeAllModals();
-                break;
-        }
-    });
-}
-
-function showShortcutsModal() {
-    openModal('shortcutsModal');
-}
-
-// ========== ANALYTICS ==========
-function initAnalytics() {
-    const saved = localStorage.getItem('jhon_analytics');
-    if (saved) {
-        analytics = JSON.parse(saved);
-    }
-    
-    trackEvent('app_loaded');
-}
-
-function trackEvent(eventName, data = {}) {
-    const event = {
-        name: eventName,
-        timestamp: new Date().toISOString(),
-        data: data,
-        account: currentAccount
-    };
-    
-    const events = JSON.parse(localStorage.getItem('jhon_events') || '[]');
-    events.push(event);
-    
-    if (events.length > 100) {
-        events.shift();
-    }
-    
-    localStorage.setItem('jhon_events', JSON.stringify(events));
-    
-    switch(eventName) {
-        case 'email_generated':
-            analytics.emailsGenerated++;
-            break;
-        case 'message_received':
-            analytics.messagesReceived++;
-            break;
-        case 'message_read':
-            analytics.messagesRead++;
-            break;
-    }
-    
-    messageDB.saveAnalytics();
-}
-
-function showAnalytics() {
-    const stats = `
-📊 ANALYTICS TempMail
-════════════════════
-📨 Pesan diterima: ${analytics.messagesReceived}
-👁️ Pesan dibaca: ${analytics.messagesRead}
-🔢 Email digenerate: ${analytics.emailsGenerated}
-⏱️ Terakhir sync: ${analytics.lastSync ? new Date(analytics.lastSync).toLocaleString() : 'Belum'}
-💾 Storage used: ${(analytics.storageUsed / 1024).toFixed(2)} KB
-    `;
-    
-    alert(stats);
-}
-
 // ========== AUTO REFRESH ==========
 function startAutoRefresh() {
     stopAutoRefresh();
@@ -1167,7 +609,14 @@ async function generateNewEmail() {
         const data = await fetchWithTimeout('/api?action=generate');
         
         if (data.success && data.result && data.result.email) {
+            // Hapus semua pesan lama
             await messageDB.clear();
+            
+            // Reset daftar pesan yang dihapus untuk account baru
+            // Tapi jangan reset untuk account lain
+            const newDeleted = new Set();
+            localStorage.setItem('jhon_deleted', JSON.stringify([...newDeleted]));
+            deletedMessages = newDeleted;
             
             currentEmail = data.result.email;
             
@@ -1176,8 +625,6 @@ async function generateNewEmail() {
             localStorage.setItem('jhon_mail', currentEmail);
             
             emailDisplay.innerText = currentEmail;
-            
-            trackEvent('email_generated');
             
             document.getElementById('unreadList').innerHTML = emptyState('updates');
             document.getElementById('readList').innerHTML = emptyState('inbox');
@@ -1209,19 +656,21 @@ async function loadCachedMessages() {
         // Get filtered messages
         const filteredMessages = await messageDB.getFiltered(currentFilter);
         
-        // Pagination
-        const startInbox = (currentPage.inbox - 1) * CONFIG.PAGINATION_PAGE_SIZE;
-        const startUpdates = (currentPage.updates - 1) * CONFIG.PAGINATION_PAGE_SIZE;
-        
+        // Pisahkan read dan unread
         const readMessages = filteredMessages.filter(m => m.isRead);
         const unreadMessages = filteredMessages.filter(m => !m.isRead);
         
+        // Hitung total pages
         totalPages.inbox = Math.ceil(readMessages.length / CONFIG.PAGINATION_PAGE_SIZE) || 1;
         totalPages.updates = Math.ceil(unreadMessages.length / CONFIG.PAGINATION_PAGE_SIZE) || 1;
         
         // Pastikan currentPage tidak melebihi totalPages
         if (currentPage.inbox > totalPages.inbox) currentPage.inbox = totalPages.inbox;
         if (currentPage.updates > totalPages.updates) currentPage.updates = totalPages.updates;
+        
+        // Pagination
+        const startInbox = (currentPage.inbox - 1) * CONFIG.PAGINATION_PAGE_SIZE;
+        const startUpdates = (currentPage.updates - 1) * CONFIG.PAGINATION_PAGE_SIZE;
         
         const paginatedRead = readMessages.slice(startInbox, startInbox + CONFIG.PAGINATION_PAGE_SIZE);
         const paginatedUnread = unreadMessages.slice(startUpdates, startUpdates + CONFIG.PAGINATION_PAGE_SIZE);
@@ -1241,9 +690,6 @@ async function fetchInbox() {
     if (!currentEmail) return;
 
     try {
-        showSkeleton('updates', true);
-        showSkeleton('inbox', true);
-        
         const data = await fetchWithTimeout(`/api?action=inbox&email=${encodeURIComponent(currentEmail)}`);
 
         if (data.success && data.result && Array.isArray(data.result.inbox)) {
@@ -1254,13 +700,16 @@ async function fetchInbox() {
             for (const msg of serverMessages) {
                 if (!msg.from || !msg.created) continue;
                 
-                // Buat ID yang konsisten
+                // Buat ID yang unik dan konsisten
                 const msgId = `${msg.created}_${msg.from}_${msg.subject || 'nosubject'}`.replace(/[^a-zA-Z0-9]/g, '_');
                 
-                // Cek apakah pesan sudah ada berdasarkan ID
+                // CEK PENTING: Jangan simpan jika:
+                // 1. Sudah ada di database
+                // 2. Pernah dihapus (ada di deletedMessages)
                 const exists = existingMessages.some(m => m.id === msgId);
+                const wasDeleted = deletedMessages.has(msgId);
                 
-                if (!exists) {
+                if (!exists && !wasDeleted) {
                     const newMessage = {
                         id: msgId,
                         from: msg.from,
@@ -1273,11 +722,13 @@ async function fetchInbox() {
                     
                     await messageDB.save(newMessage);
                     newMessagesCount++;
+                    log('New message saved:', msgId);
+                } else {
+                    log('Message skipped - exists or was deleted:', msgId);
                 }
             }
             
             if (newMessagesCount > 0) {
-                trackEvent('messages_received', { count: newMessagesCount });
                 showToast(`${newMessagesCount} pesan baru diterima`, 'success');
                 playNotification();
             }
@@ -1289,9 +740,6 @@ async function fetchInbox() {
         if (e.message !== 'Request timeout') {
             showToast('Gagal mengambil pesan', 'error');
         }
-    } finally {
-        showSkeleton('updates', false);
-        showSkeleton('inbox', false);
     }
 }
 
@@ -1485,19 +933,14 @@ async function openMessage(msgId) {
             return;
         }
 
-        trackEvent('message_read', { msgId: msgId });
-
         const initial = msg.from ? msg.from.charAt(0).toUpperCase() : '?';
         document.getElementById('modalSubject').innerText = msg.subject || '(Tanpa Subjek)';
         document.getElementById('modalBody').innerText = msg.message || '(Kosong)';
         
-        const isEmailLong = msg.from && msg.from.length > 25;
-        const emailClass = isEmailLong ? 'email-long' : '';
-        
         document.getElementById('modalMeta').innerHTML = `
             <div class="meta-avatar">${escapeString(initial)}</div>
             <div class="meta-info">
-                <div class="meta-from ${emailClass}" title="${escapeString(msg.from || 'Unknown')}">${escapeString(msg.from || 'Unknown')}</div>
+                <div class="meta-from" title="${escapeString(msg.from || 'Unknown')}">${escapeString(msg.from || 'Unknown')}</div>
                 <div class="meta-time">${escapeString(formatTime(msg.created))}</div>
             </div>
         `;
@@ -1533,6 +976,41 @@ async function openMessage(msgId) {
     }
 }
 
+// ========== TOGGLE STARRED ==========
+async function toggleStarred(msgId) {
+    try {
+        if (starredMessages.has(msgId)) {
+            starredMessages.delete(msgId);
+            showToast('Dihapus dari favorit', 'info');
+        } else {
+            starredMessages.add(msgId);
+            showToast('Ditambahkan ke favorit', 'success');
+        }
+        
+        localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+        
+        // Update star button di modal
+        const starBtn = document.querySelector('.star-btn');
+        if (starBtn) {
+            if (starredMessages.has(msgId)) {
+                starBtn.classList.add('active');
+                starBtn.innerHTML = '<i class="bi bi-star-fill"></i>';
+                starBtn.title = 'Hapus dari favorit';
+            } else {
+                starBtn.classList.remove('active');
+                starBtn.innerHTML = '<i class="bi bi-star"></i>';
+                starBtn.title = 'Tambah ke favorit';
+            }
+        }
+        
+        // Refresh list untuk update icon bintang
+        await loadCachedMessages();
+    } catch (e) {
+        log('Toggle starred error:', e);
+        showToast('Gagal mengupdate favorit', 'error');
+    }
+}
+
 // ========== COPY EMAIL ==========
 function copyEmail() {
     if (!currentEmail) {
@@ -1551,7 +1029,7 @@ function copyEmail() {
 async function clearInbox() {
     showConfirm(
         'Hapus Inbox',
-        'Semua pesan yang sudah dibaca akan dihapus permanen. Lanjutkan?',
+        'Semua pesan yang sudah dibaca akan dihapus permanen dan TIDAK akan muncul lagi. Lanjutkan?',
         async () => {
             try {
                 setButtonLoading('clearInboxBtn', true);
@@ -1569,6 +1047,339 @@ async function clearInbox() {
             }
         }
     );
+}
+
+// ========== FILTER FUNCTIONS ==========
+function showFilterModal() {
+    // Set active status chip
+    document.querySelectorAll('.filter-chip').forEach(chip => {
+        if (chip.dataset.status === currentFilter.status) {
+            chip.classList.add('active');
+        } else {
+            chip.classList.remove('active');
+        }
+    });
+    
+    // Set date select
+    const dateSelect = document.getElementById('filterDate');
+    dateSelect.value = currentFilter.date;
+    
+    // Set search input
+    document.getElementById('filterSearch').value = currentFilter.search || '';
+    
+    // Set custom date inputs
+    document.getElementById('filterDateFrom').value = currentFilter.dateFrom || '';
+    document.getElementById('filterDateTo').value = currentFilter.dateTo || '';
+    
+    // Show/hide custom date range
+    document.getElementById('customDateRange').style.display = 
+        currentFilter.date === 'custom' ? 'block' : 'none';
+    
+    openModal('filterModal');
+}
+
+async function applyFilter() {
+    // Get status from active chip
+    const activeChip = document.querySelector('.filter-chip.active');
+    currentFilter.status = activeChip ? activeChip.dataset.status : 'all';
+    
+    // Get date
+    currentFilter.date = document.getElementById('filterDate').value;
+    
+    // Get custom dates
+    if (currentFilter.date === 'custom') {
+        currentFilter.dateFrom = document.getElementById('filterDateFrom').value;
+        currentFilter.dateTo = document.getElementById('filterDateTo').value;
+    } else {
+        currentFilter.dateFrom = null;
+        currentFilter.dateTo = null;
+    }
+    
+    // Get search
+    currentFilter.search = document.getElementById('filterSearch').value;
+    
+    closeModal('filterModal');
+    
+    // Reset ke halaman 1
+    currentPage.inbox = 1;
+    currentPage.updates = 1;
+    
+    await loadCachedMessages();
+    showToast('Filter diterapkan', 'success');
+}
+
+function resetFilter() {
+    currentFilter = {
+        status: 'all',
+        date: 'all',
+        search: '',
+        dateFrom: null,
+        dateTo: null
+    };
+    
+    closeModal('filterModal');
+    
+    // Reset UI
+    document.querySelectorAll('.filter-chip').forEach(chip => {
+        if (chip.dataset.status === 'all') {
+            chip.classList.add('active');
+        } else {
+            chip.classList.remove('active');
+        }
+    });
+    
+    document.getElementById('filterDate').value = 'all';
+    document.getElementById('filterSearch').value = '';
+    document.getElementById('customDateRange').style.display = 'none';
+    
+    // Reset ke halaman 1
+    currentPage.inbox = 1;
+    currentPage.updates = 1;
+    
+    loadCachedMessages();
+    showToast('Filter direset', 'success');
+}
+
+// ========== MARK ALL AS READ ==========
+async function markAllAsRead() {
+    try {
+        showGlobalLoading(true);
+        
+        const messages = await messageDB.getAll();
+        const unreadMessages = messages.filter(m => !m.isRead);
+        
+        for (const msg of unreadMessages) {
+            msg.isRead = true;
+            await messageDB.save(msg);
+        }
+        
+        await loadCachedMessages();
+        showToast('Semua pesan ditandai telah dibaca', 'success');
+    } catch (e) {
+        log('Mark all as read error:', e);
+        showToast('Gagal menandai pesan', 'error');
+    } finally {
+        showGlobalLoading(false);
+    }
+}
+
+// ========== MULTIPLE ACCOUNTS ==========
+async function switchAccount(accountId) {
+    showConfirm(
+        'Ganti Account',
+        'Beralih ke account lain?',
+        async () => {
+            currentAccount = accountId;
+            localStorage.setItem('jhon_current_account', accountId);
+            
+            currentEmail = accounts[accountId].email;
+            if (currentEmail) {
+                localStorage.setItem('jhon_mail', currentEmail);
+                document.getElementById('emailAddress').innerText = currentEmail;
+            }
+            
+            // Reset filter
+            resetFilter();
+            
+            await loadCachedMessages();
+            showToast(`Beralih ke ${accounts[accountId].name}`, 'success');
+            closeModal('accountsModal');
+        }
+    );
+}
+
+function showAccountsModal() {
+    const accountsList = document.getElementById('accountsList');
+    let html = '';
+    
+    Object.keys(accounts).forEach(accountId => {
+        const account = accounts[accountId];
+        const isActive = accountId === currentAccount;
+        
+        html += `
+            <div class="account-item ${isActive ? 'active' : ''}" onclick="switchAccount('${accountId}')">
+                <div class="account-avatar">${account.name.charAt(0).toUpperCase()}</div>
+                <div class="account-info">
+                    <div class="account-name">${account.name}</div>
+                    <div class="account-email">${account.email || 'Belum ada email'}</div>
+                </div>
+                ${isActive ? '<i class="bi bi-check-circle-fill account-check"></i>' : ''}
+            </div>
+        `;
+    });
+    
+    accountsList.innerHTML = html || '<div class="empty-placeholder">Belum ada account</div>';
+    openModal('accountsModal');
+}
+
+function showAddAccountModal() {
+    document.getElementById('newAccountName').value = '';
+    document.getElementById('newAccountEmail').value = '';
+    openModal('addAccountModal');
+}
+
+async function addNewAccount() {
+    const name = document.getElementById('newAccountName').value.trim();
+    const email = document.getElementById('newAccountEmail').value.trim();
+    
+    if (!name) {
+        showToast('Nama account harus diisi', 'error');
+        return;
+    }
+    
+    const accountId = 'account_' + Date.now();
+    
+    accounts[accountId] = {
+        name: name,
+        email: email || null
+    };
+    
+    localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
+    
+    if (email) {
+        currentEmail = email;
+        currentAccount = accountId;
+        localStorage.setItem('jhon_mail', email);
+        localStorage.setItem('jhon_current_account', accountId);
+        document.getElementById('emailAddress').innerText = email;
+        await loadCachedMessages();
+    }
+    
+    closeModal('addAccountModal');
+    showAccountsModal();
+    showToast('Account berhasil ditambahkan', 'success');
+}
+
+// ========== DARK MODE ==========
+function toggleDarkMode() {
+    darkMode = !darkMode;
+    
+    if (darkMode) {
+        document.body.classList.add('dark-mode');
+    } else {
+        document.body.classList.remove('dark-mode');
+    }
+    
+    localStorage.setItem('jhon_darkmode', darkMode);
+    showToast(darkMode ? 'Dark mode aktif' : 'Light mode aktif', 'success');
+}
+
+// ========== BACKUP & RESTORE ==========
+async function exportBackup() {
+    try {
+        showGlobalLoading(true);
+        
+        const messages = await messageDB.getAll();
+        const backup = {
+            version: CONFIG.DB_VERSION,
+            timestamp: new Date().toISOString(),
+            data: {
+                messages: messages,
+                accounts: accounts,
+                starred: [...starredMessages],
+                deleted: [...deletedMessages],
+                analytics: analytics,
+                settings: {
+                    darkMode: darkMode,
+                    refreshInterval: CONFIG.REFRESH_INTERVAL
+                }
+            }
+        };
+        
+        const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `tempmail-backup-${new Date().toISOString().split('T')[0]}.json`;
+        a.click();
+        
+        URL.revokeObjectURL(url);
+        showToast('Backup berhasil dibuat', 'success');
+        closeModal('backupModal');
+    } catch (e) {
+        log('Export backup error:', e);
+        showToast('Gagal membuat backup', 'error');
+    } finally {
+        showGlobalLoading(false);
+    }
+}
+
+async function importBackup(input) {
+    const file = input.files[0];
+    if (!file) return;
+    
+    try {
+        showGlobalLoading(true);
+        
+        const text = await file.text();
+        const backup = JSON.parse(text);
+        
+        if (!backup.version || !backup.data) {
+            throw new Error('Format backup tidak valid');
+        }
+        
+        // Restore messages
+        if (backup.data.messages) {
+            await messageDB.clear();
+            for (const msg of backup.data.messages) {
+                await messageDB.save(msg);
+            }
+        }
+        
+        // Restore accounts
+        if (backup.data.accounts) {
+            accounts = backup.data.accounts;
+            localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
+        }
+        
+        // Restore starred
+        if (backup.data.starred) {
+            starredMessages = new Set(backup.data.starred);
+            localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+        }
+        
+        // Restore deleted
+        if (backup.data.deleted) {
+            deletedMessages = new Set(backup.data.deleted);
+            localStorage.setItem('jhon_deleted', JSON.stringify([...deletedMessages]));
+        }
+        
+        // Restore settings
+        if (backup.data.settings) {
+            darkMode = backup.data.settings.darkMode;
+            if (darkMode) document.body.classList.add('dark-mode');
+            else document.body.classList.remove('dark-mode');
+            localStorage.setItem('jhon_darkmode', darkMode);
+        }
+        
+        await loadCachedMessages();
+        showToast('Backup berhasil direstore', 'success');
+        closeModal('backupModal');
+    } catch (e) {
+        log('Import backup error:', e);
+        showToast('Gagal merestore backup: ' + e.message, 'error');
+    } finally {
+        showGlobalLoading(false);
+        input.value = '';
+    }
+}
+
+function showBackupModal() {
+    const totalMsg = document.getElementById('backupTotalMsg');
+    const backupSize = document.getElementById('backupSize');
+    
+    totalMsg.textContent = analytics.messagesReceived || 0;
+    
+    const size = analytics.storageUsed || 0;
+    if (size < 1024) {
+        backupSize.textContent = size + ' B';
+    } else if (size < 1024 * 1024) {
+        backupSize.textContent = (size / 1024).toFixed(2) + ' KB';
+    } else {
+        backupSize.textContent = (size / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+    
+    openModal('backupModal');
 }
 
 // ========== SHARE FUNCTIONS ==========
@@ -1703,18 +1514,106 @@ function copyMessageText() {
     }
 }
 
+// ========== KEYBOARD SHORTCUTS ==========
+function setupKeyboardShortcuts() {
+    document.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') {
+            return;
+        }
+        
+        const key = e.key.toLowerCase();
+        
+        switch(key) {
+            case 'g':
+                e.preventDefault();
+                confirmNewEmail();
+                break;
+            case 'r':
+                e.preventDefault();
+                fetchInbox();
+                break;
+            case 'c':
+                e.preventDefault();
+                copyEmail();
+                break;
+            case 'f':
+                e.preventDefault();
+                showFilterModal();
+                break;
+            case '/':
+                e.preventDefault();
+                document.getElementById('filterSearch')?.focus();
+                break;
+            case 'm':
+                e.preventDefault();
+                markAllAsRead();
+                break;
+            case 'd':
+                e.preventDefault();
+                toggleDarkMode();
+                break;
+            case '1':
+                e.preventDefault();
+                switchTab('view-home', document.querySelector('.nav-item:first-child'));
+                break;
+            case '2':
+                e.preventDefault();
+                switchTab('view-inbox', document.querySelectorAll('.nav-item')[1]);
+                break;
+            case '3':
+                e.preventDefault();
+                switchTab('view-updates', document.querySelectorAll('.nav-item')[3]);
+                break;
+            case '4':
+                e.preventDefault();
+                switchTab('view-docs', document.querySelectorAll('.nav-item')[4]);
+                break;
+            case '?':
+                e.preventDefault();
+                showShortcutsModal();
+                break;
+            case 'escape':
+                closeAllModals();
+                break;
+        }
+    });
+}
+
+function showShortcutsModal() {
+    openModal('shortcutsModal');
+}
+
+// ========== ANALYTICS ==========
+function initAnalytics() {
+    const saved = localStorage.getItem('jhon_analytics');
+    if (saved) {
+        analytics = JSON.parse(saved);
+    }
+}
+
+function showAnalytics() {
+    const stats = `
+📊 ANALYTICS TempMail
+════════════════════
+📨 Pesan diterima: ${analytics.messagesReceived}
+👁️ Pesan dibaca: ${analytics.messagesRead}
+🔢 Email digenerate: ${analytics.emailsGenerated}
+⏱️ Terakhir sync: ${analytics.lastSync ? new Date(analytics.lastSync).toLocaleString() : 'Belum'}
+💾 Storage used: ${(analytics.storageUsed / 1024).toFixed(2)} KB
+    `;
+    
+    alert(stats);
+}
+
 // ========== MODAL HANDLERS ==========
 function setupModalClickHandlers() {
-    const msgModal = document.getElementById('msgModal');
-    const shareModal = document.getElementById('shareMsgModal');
-    const confirmModal = document.getElementById('confirmModal');
-    const filterModal = document.getElementById('filterModal');
-    const backupModal = document.getElementById('backupModal');
-    const accountsModal = document.getElementById('accountsModal');
-    const shortcutsModal = document.getElementById('shortcutsModal');
-    const addAccountModal = document.getElementById('addAccountModal');
+    const modals = [
+        'msgModal', 'shareMsgModal', 'confirmModal', 'filterModal', 
+        'backupModal', 'accountsModal', 'shortcutsModal', 'addAccountModal'
+    ];
     
-    [msgModal, shareModal, confirmModal, filterModal, backupModal, accountsModal, shortcutsModal, addAccountModal].forEach(modal => {
+    modals.forEach(modalId => {
+        const modal = document.getElementById(modalId);
         if (modal) {
             modal.addEventListener('click', function(event) {
                 if (event.target === modal) {
@@ -1747,10 +1646,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
         showGlobalLoading(true);
         
+        // Load deleted messages from localStorage
+        const savedDeleted = localStorage.getItem('jhon_deleted');
+        if (savedDeleted) {
+            deletedMessages = new Set(JSON.parse(savedDeleted));
+        }
+        
         // Inisialisasi database
         await messageDB.init();
         initAnalytics();
-        initSync();
         setupKeyboardShortcuts();
         
         // Terapkan dark mode jika aktif
@@ -1790,9 +1694,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ========== CLEANUP ==========
 window.addEventListener('beforeunload', function() {
     stopAutoRefresh();
-    if (syncInterval) {
-        clearInterval(syncInterval);
-    }
     if (messageDB && messageDB.db) {
         messageDB.db.close();
     }
