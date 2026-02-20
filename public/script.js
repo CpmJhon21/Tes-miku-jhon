@@ -1481,25 +1481,23 @@ function shareToWaText() {
         const modalFrom = document.querySelector('.meta-from')?.innerText || 'Unknown';
         const modalTime = document.querySelector('.meta-time')?.innerText || '';
         
-        const text = `📊 *Jhon-TempMail*
+         const text = `📊 *Jhon-TempMail*
 ════════════════════
          *PESAN TERKIRIM*
 ════════════════════
-📨 *Pesan diterima:*
- `${modalSubject}`
+📨 *Pesan diterima:* ${modalSubject}
+
 ════════════════════
-📧 *Email Dari:*
- `${modalFrom}`
+📧 *Email Dari:* ${modalFrom}
+
 ════════════════════
-⏱️ *Waktu:* 
-`${modalTime}`
+⏱️ *Waktu:* ${modalTime}
+
 ════════════════════
-🗓️ *Tanggal bulan tahun:* 
-`${new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}`
+🗓️ *Tanggal bulan tahun:* ${new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}
+
 ════════════════════
-💾 *Dikirim via:* `TempMail - JHON FORUM`
-════════════════════
-> Developer: `JHON PRODUCTION`
+💾 *Dikirim via:* TempMail - JHON FORUM
 ════════════════════`;
         
         const waUrl = `https://wa.me/?text=${encodeURIComponent(text)}`;
