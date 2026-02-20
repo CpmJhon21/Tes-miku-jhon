@@ -1,11 +1,10 @@
 // ========== KONFIGURASI ==========
 const CONFIG = {
     DB_NAME: 'jhonMailDB',
-    DB_VERSION: 2,
+    DB_VERSION: 3, // Upgrade ke versi 3
     STORE_NAME: 'messages',
     STORE_ACCOUNTS: 'accounts',
     STORE_SETTINGS: 'settings',
-    STORE_STARRED: 'starred',
     REFRESH_INTERVAL: 10,
     REQUEST_TIMEOUT: 10000,
     MAX_RETRY: 3,
@@ -51,6 +50,14 @@ let analytics = {
     storageUsed: 0
 };
 
+// Cache untuk menyimpan pesan yang sudah difilter
+let cachedMessages = {
+    all: [],
+    filtered: [],
+    unread: [],
+    read: []
+};
+
 // ========== CLASS MessageDB ==========
 class MessageDB {
     constructor(dbName, storeName) {
@@ -67,12 +74,17 @@ class MessageDB {
                 request.onupgradeneeded = (e) => {
                     const db = e.target.result;
                     
-                    if (!db.objectStoreNames.contains(this.storeName)) {
-                        const messageStore = db.createObjectStore(this.storeName, { keyPath: 'id' });
-                        messageStore.createIndex('account', 'account', { unique: false });
-                        messageStore.createIndex('created', 'created', { unique: false });
-                        messageStore.createIndex('isRead', 'isRead', { unique: false });
+                    // Hapus store lama jika ada
+                    if (db.objectStoreNames.contains(this.storeName)) {
+                        db.deleteObjectStore(this.storeName);
                     }
+                    
+                    // Buat store baru dengan struktur yang benar
+                    const messageStore = db.createObjectStore(this.storeName, { keyPath: 'id' });
+                    messageStore.createIndex('account', 'account', { unique: false });
+                    messageStore.createIndex('created', 'created', { unique: false });
+                    messageStore.createIndex('isRead', 'isRead', { unique: false });
+                    messageStore.createIndex('starred', 'starred', { unique: false });
                     
                     if (!db.objectStoreNames.contains(CONFIG.STORE_ACCOUNTS)) {
                         const accountStore = db.createObjectStore(CONFIG.STORE_ACCOUNTS, { keyPath: 'id' });
@@ -127,13 +139,22 @@ class MessageDB {
                 const tx = this.db.transaction(this.storeName, 'readwrite');
                 const store = tx.objectStore(this.storeName);
                 
-                message.account = currentAccount;
-                message.starred = starredMessages.has(message.id);
+                // Pastikan semua field ada
+                const messageToSave = {
+                    id: message.id,
+                    from: message.from || 'Unknown',
+                    subject: message.subject || '(Tanpa Subjek)',
+                    message: message.message || '(Kosong)',
+                    created: message.created || new Date().toISOString(),
+                    isRead: message.isRead || false,
+                    account: currentAccount,
+                    starred: starredMessages.has(message.id)
+                };
                 
-                const request = store.put(message);
+                const request = store.put(messageToSave);
                 
                 request.onsuccess = () => {
-                    log('Message saved:', message.id, 'isRead:', message.isRead);
+                    log('Message saved:', message.id);
                     this.updateAnalytics();
                     resolve();
                 };
@@ -149,7 +170,7 @@ class MessageDB {
         }
     }
 
-    async getAll(filter = {}, page = 1, pageSize = CONFIG.PAGINATION_PAGE_SIZE) {
+    async getAll(accountId = currentAccount) {
         try {
             await this.ensureConnection();
             
@@ -162,36 +183,21 @@ class MessageDB {
                     let messages = request.result || [];
                     
                     // Filter by account
-                    messages = messages.filter(m => m.account === currentAccount);
+                    messages = messages.filter(m => m.account === accountId);
                     
-                    // Log untuk debugging
-                    log('All messages before filter:', messages.length);
-                    log('Current filter:', filter);
-                    
-                    // Apply filters
-                    messages = this.applyFilters(messages, filter);
-                    
-                    log('Messages after filter:', messages.length);
-                    
-                    // Sort by date descending
+                    // Sort by created date descending
                     messages.sort((a, b) => {
-                        try {
-                            return new Date(b.created) - new Date(a.created);
-                        } catch {
-                            return 0;
-                        }
+                        const dateA = new Date(a.created || 0);
+                        const dateB = new Date(b.created || 0);
+                        return dateB - dateA;
                     });
                     
-                    const total = messages.length;
-                    const start = (page - 1) * pageSize;
-                    const end = start + pageSize;
+                    // Update cache
+                    cachedMessages.all = messages;
+                    cachedMessages.unread = messages.filter(m => !m.isRead);
+                    cachedMessages.read = messages.filter(m => m.isRead);
                     
-                    resolve({
-                        items: messages.slice(start, end),
-                        total: total,
-                        page: page,
-                        totalPages: Math.ceil(total / pageSize)
-                    });
+                    resolve(messages);
                 };
                 
                 request.onerror = (e) => {
@@ -201,71 +207,55 @@ class MessageDB {
             });
         } catch (e) {
             log('Get all error:', e);
-            return { items: [], total: 0, page: 1, totalPages: 1 };
+            return [];
         }
     }
 
-    applyFilters(messages, filter) {
+    async getFiltered(filter = currentFilter) {
+        const messages = await this.getAll();
+        
         return messages.filter(msg => {
             // Status filter
-            if (filter.status === 'unread' && msg.isRead) {
-                return false;
-            }
-            if (filter.status === 'read' && !msg.isRead) {
-                return false;
-            }
+            if (filter.status === 'unread' && msg.isRead) return false;
+            if (filter.status === 'read' && !msg.isRead) return false;
             
             // Date filter
-            if (filter.date && filter.date !== 'all') {
-                try {
-                    const msgDate = new Date(msg.created);
-                    const today = new Date();
-                    
-                    // Reset time to start of day for date comparison
-                    const startOfDay = new Date(today);
-                    startOfDay.setHours(0, 0, 0, 0);
-                    
-                    switch(filter.date) {
-                        case 'today':
-                            const msgDay = new Date(msgDate);
-                            msgDay.setHours(0, 0, 0, 0);
-                            if (msgDay.getTime() !== startOfDay.getTime()) {
-                                return false;
-                            }
-                            break;
-                        case 'week':
-                            const weekAgo = new Date(today);
-                            weekAgo.setDate(weekAgo.getDate() - 7);
-                            if (msgDate < weekAgo) {
-                                return false;
-                            }
-                            break;
-                        case 'month':
-                            const monthAgo = new Date(today);
-                            monthAgo.setMonth(monthAgo.getMonth() - 1);
-                            if (msgDate < monthAgo) {
-                                return false;
-                            }
-                            break;
-                        case 'custom':
-                            if (filter.dateFrom) {
-                                const fromDate = new Date(filter.dateFrom);
-                                fromDate.setHours(0, 0, 0, 0);
-                                if (msgDate < fromDate) {
-                                    return false;
-                                }
-                            }
-                            if (filter.dateTo) {
-                                const toDate = new Date(filter.dateTo);
-                                toDate.setHours(23, 59, 59, 999);
-                                if (msgDate > toDate) {
-                                    return false;
-                                }
-                            }
-                            break;
-                    }
-                } catch (e) {
-                    log('Date filter error:', e);
+            if (filter.date !== 'all') {
+                const msgDate = new Date(msg.created);
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+                
+                switch(filter.date) {
+                    case 'today':
+                        const msgDateStr = msgDate.toDateString();
+                        const todayStr = today.toDateString();
+                        if (msgDateStr !== todayStr) return false;
+                        break;
+                        
+                    case 'week':
+                        const weekAgo = new Date(today);
+                        weekAgo.setDate(today.getDate() - 7);
+                        if (msgDate < weekAgo) return false;
+                        break;
+                        
+                    case 'month':
+                        const monthAgo = new Date(today);
+                        monthAgo.setMonth(today.getMonth() - 1);
+                        if (msgDate < monthAgo) return false;
+                        break;
+                        
+                    case 'custom':
+                        if (filter.dateFrom) {
+                            const fromDate = new Date(filter.dateFrom);
+                            fromDate.setHours(0, 0, 0, 0);
+                            if (msgDate < fromDate) return false;
+                        }
+                        if (filter.dateTo) {
+                            const toDate = new Date(filter.dateTo);
+                            toDate.setHours(23, 59, 59, 999);
+                            if (msgDate > toDate) return false;
+                        }
+                        break;
                 }
             }
             
@@ -277,9 +267,7 @@ class MessageDB {
                     (msg.subject && msg.subject.toLowerCase().includes(searchLower)) ||
                     (msg.message && msg.message.toLowerCase().includes(searchLower));
                 
-                if (!matches) {
-                    return false;
-                }
+                if (!matches) return false;
             }
             
             return true;
@@ -326,6 +314,13 @@ class MessageDB {
                         }
                         cursor.continue();
                     } else {
+                        // Clear cache
+                        cachedMessages = {
+                            all: [],
+                            filtered: [],
+                            unread: [],
+                            read: []
+                        };
                         resolve();
                     }
                 };
@@ -352,6 +347,12 @@ class MessageDB {
                 request.onsuccess = () => {
                     starredMessages.delete(id);
                     localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+                    
+                    // Update cache
+                    cachedMessages.all = cachedMessages.all.filter(m => m.id !== id);
+                    cachedMessages.unread = cachedMessages.unread.filter(m => m.id !== id);
+                    cachedMessages.read = cachedMessages.read.filter(m => m.id !== id);
+                    
                     log('Message deleted:', id);
                     resolve();
                 };
@@ -367,13 +368,52 @@ class MessageDB {
         }
     }
 
+    async deleteReadMessages() {
+        try {
+            await this.ensureConnection();
+            
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(this.storeName, 'readwrite');
+                const store = tx.objectStore(this.storeName);
+                
+                const request = store.openCursor();
+                request.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        if (cursor.value.account === currentAccount && cursor.value.isRead) {
+                            starredMessages.delete(cursor.value.id);
+                            cursor.delete();
+                        }
+                        cursor.continue();
+                    } else {
+                        localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+                        
+                        // Update cache
+                        cachedMessages.all = cachedMessages.all.filter(m => !m.isRead);
+                        cachedMessages.read = [];
+                        cachedMessages.unread = cachedMessages.all.filter(m => !m.isRead);
+                        
+                        resolve();
+                    }
+                };
+                
+                request.onerror = (e) => {
+                    reject(new Error('Failed to delete read messages: ' + e.target.error));
+                };
+            });
+        } catch (e) {
+            log('Delete read messages error:', e);
+            throw e;
+        }
+    }
+
     async updateAnalytics() {
         try {
-            const result = await this.getAll();
-            analytics.messagesReceived = result.total;
-            analytics.messagesRead = result.items.filter(m => m.isRead).length;
+            const messages = await this.getAll();
+            analytics.messagesReceived = messages.length;
+            analytics.messagesRead = messages.filter(m => m.isRead).length;
             
-            const serialized = JSON.stringify(result.items);
+            const serialized = JSON.stringify(messages);
             analytics.storageUsed = new Blob([serialized]).size;
             
             this.saveAnalytics();
@@ -535,31 +575,6 @@ function escapeString(str) {
     return div.innerHTML;
 }
 
-function formatDate(dateStr) {
-    try {
-        const date = new Date(dateStr);
-        const now = new Date();
-        const diffMs = now - date;
-        const diffMins = Math.floor(diffMs / 60000);
-        const diffHours = Math.floor(diffMs / 3600000);
-        const diffDays = Math.floor(diffMs / 86400000);
-
-        if (diffMins < 1) return 'Baru saja';
-        if (diffMins < 60) return `${diffMins} menit lalu`;
-        if (diffHours < 24) return `${diffHours} jam lalu`;
-        if (diffDays < 7) return `${diffDays} hari lalu`;
-        
-        return date.toLocaleDateString('id-ID', { 
-            day: 'numeric', 
-            month: 'short', 
-            hour: '2-digit', 
-            minute: '2-digit' 
-        });
-    } catch (e) {
-        return dateStr;
-    }
-}
-
 // ========== SYNC FUNCTIONS ==========
 function initSync() {
     if (syncInterval) {
@@ -579,10 +594,10 @@ function initSync() {
 
 async function syncWithOtherTabs() {
     try {
-        const result = await messageDB.getAll();
+        const messages = await messageDB.getAll();
         const data = {
             timestamp: Date.now(),
-            messages: result.items,
+            messages: messages,
             accounts: accounts,
             currentAccount: currentAccount,
             starred: [...starredMessages]
@@ -628,12 +643,12 @@ async function exportBackup() {
     try {
         showGlobalLoading(true);
         
-        const result = await messageDB.getAll({}, 1, 9999);
+        const messages = await messageDB.getAll();
         const backup = {
             version: CONFIG.DB_VERSION,
             timestamp: new Date().toISOString(),
             data: {
-                messages: result.items,
+                messages: messages,
                 accounts: accounts,
                 starred: [...starredMessages],
                 analytics: analytics,
@@ -824,6 +839,7 @@ function toggleDarkMode() {
 
 // ========== FILTER FUNCTIONS ==========
 function showFilterModal() {
+    // Set active status chip
     document.querySelectorAll('.filter-chip').forEach(chip => {
         if (chip.dataset.status === currentFilter.status) {
             chip.classList.add('active');
@@ -832,42 +848,43 @@ function showFilterModal() {
         }
     });
     
-    document.getElementById('filterDate').value = currentFilter.date;
-    document.getElementById('filterSearch').value = currentFilter.search;
+    // Set date select
+    const dateSelect = document.getElementById('filterDate');
+    dateSelect.value = currentFilter.date;
+    
+    // Set search input
+    document.getElementById('filterSearch').value = currentFilter.search || '';
+    
+    // Set custom date inputs
     document.getElementById('filterDateFrom').value = currentFilter.dateFrom || '';
     document.getElementById('filterDateTo').value = currentFilter.dateTo || '';
     
+    // Show/hide custom date range
     document.getElementById('customDateRange').style.display = 
         currentFilter.date === 'custom' ? 'block' : 'none';
     
     openModal('filterModal');
 }
 
-function applyFilter() {
+async function applyFilter() {
+    // Get status from active chip
     const activeChip = document.querySelector('.filter-chip.active');
     currentFilter.status = activeChip ? activeChip.dataset.status : 'all';
     
+    // Get date
     currentFilter.date = document.getElementById('filterDate').value;
     
+    // Get custom dates
     if (currentFilter.date === 'custom') {
         currentFilter.dateFrom = document.getElementById('filterDateFrom').value;
         currentFilter.dateTo = document.getElementById('filterDateTo').value;
-        
-        // Validasi tanggal
-        if (currentFilter.dateFrom && currentFilter.dateTo) {
-            if (new Date(currentFilter.dateFrom) > new Date(currentFilter.dateTo)) {
-                showToast('Tanggal "Dari" harus sebelum "Sampai"', 'error');
-                return;
-            }
-        }
     } else {
         currentFilter.dateFrom = null;
         currentFilter.dateTo = null;
     }
     
+    // Get search
     currentFilter.search = document.getElementById('filterSearch').value;
-    
-    log('Applied filter:', currentFilter);
     
     closeModal('filterModal');
     
@@ -875,7 +892,7 @@ function applyFilter() {
     currentPage.inbox = 1;
     currentPage.updates = 1;
     
-    loadCachedMessages();
+    await loadCachedMessages();
     showToast('Filter diterapkan', 'success');
 }
 
@@ -888,7 +905,9 @@ function resetFilter() {
         dateTo: null
     };
     
-    // Reset UI
+    closeModal('filterModal');
+    
+    // Reset UI chips
     document.querySelectorAll('.filter-chip').forEach(chip => {
         if (chip.dataset.status === 'all') {
             chip.classList.add('active');
@@ -899,13 +918,7 @@ function resetFilter() {
     
     document.getElementById('filterDate').value = 'all';
     document.getElementById('filterSearch').value = '';
-    document.getElementById('filterDateFrom').value = '';
-    document.getElementById('filterDateTo').value = '';
     document.getElementById('customDateRange').style.display = 'none';
-    
-    log('Filter reset');
-    
-    closeModal('filterModal');
     
     // Reset ke halaman 1
     currentPage.inbox = 1;
@@ -920,10 +933,8 @@ async function markAllAsRead() {
     try {
         showGlobalLoading(true);
         
-        const result = await messageDB.getAll({}, 1, 9999);
-        const unreadMessages = result.items.filter(m => !m.isRead);
-        
-        log('Marking as read:', unreadMessages.length, 'messages');
+        const messages = await messageDB.getAll();
+        const unreadMessages = messages.filter(m => !m.isRead);
         
         for (const msg of unreadMessages) {
             msg.isRead = true;
@@ -931,7 +942,7 @@ async function markAllAsRead() {
         }
         
         await loadCachedMessages();
-        showToast(`${unreadMessages.length} pesan ditandai telah dibaca`, 'success');
+        showToast('Semua pesan ditandai telah dibaca', 'success');
     } catch (e) {
         log('Mark all as read error:', e);
         showToast('Gagal menandai pesan', 'error');
@@ -1192,20 +1203,37 @@ async function generateNewEmail() {
 // ========== MESSAGE OPERATIONS ==========
 async function loadCachedMessages() {
     try {
-        showGlobalLoading(true);
+        showSkeleton('inbox', true);
+        showSkeleton('updates', true);
         
-        // Ambil semua pesan dengan filter
-        const result = await messageDB.getAll(currentFilter, currentPage.inbox);
-        totalPages.inbox = result.totalPages;
+        // Get filtered messages
+        const filteredMessages = await messageDB.getFiltered(currentFilter);
         
-        // Render pesan
-        renderMessages(result.items);
+        // Pagination
+        const startInbox = (currentPage.inbox - 1) * CONFIG.PAGINATION_PAGE_SIZE;
+        const startUpdates = (currentPage.updates - 1) * CONFIG.PAGINATION_PAGE_SIZE;
         
-        showGlobalLoading(false);
+        const readMessages = filteredMessages.filter(m => m.isRead);
+        const unreadMessages = filteredMessages.filter(m => !m.isRead);
+        
+        totalPages.inbox = Math.ceil(readMessages.length / CONFIG.PAGINATION_PAGE_SIZE) || 1;
+        totalPages.updates = Math.ceil(unreadMessages.length / CONFIG.PAGINATION_PAGE_SIZE) || 1;
+        
+        // Pastikan currentPage tidak melebihi totalPages
+        if (currentPage.inbox > totalPages.inbox) currentPage.inbox = totalPages.inbox;
+        if (currentPage.updates > totalPages.updates) currentPage.updates = totalPages.updates;
+        
+        const paginatedRead = readMessages.slice(startInbox, startInbox + CONFIG.PAGINATION_PAGE_SIZE);
+        const paginatedUnread = unreadMessages.slice(startUpdates, startUpdates + CONFIG.PAGINATION_PAGE_SIZE);
+        
+        renderMessages(paginatedRead, paginatedUnread, unreadMessages.length);
+        
     } catch (e) {
         log('Load cached messages error:', e);
         showToast('Gagal memuat pesan', 'error');
-        showGlobalLoading(false);
+    } finally {
+        showSkeleton('inbox', false);
+        showSkeleton('updates', false);
     }
 }
 
@@ -1220,31 +1248,31 @@ async function fetchInbox() {
 
         if (data.success && data.result && Array.isArray(data.result.inbox)) {
             const serverMessages = data.result.inbox;
-            const result = await messageDB.getAll({}, 1, 9999);
-            const existingMessages = result.items;
+            const existingMessages = await messageDB.getAll();
             let newMessagesCount = 0;
             
             for (const msg of serverMessages) {
                 if (!msg.from || !msg.created) continue;
                 
-                const msgId = `${msg.created}_${msg.from}`.replace(/\s/g, '');
-                const exists = existingMessages.find(m => m.id === msgId);
+                // Buat ID yang konsisten
+                const msgId = `${msg.created}_${msg.from}_${msg.subject || 'nosubject'}`.replace(/[^a-zA-Z0-9]/g, '_');
+                
+                // Cek apakah pesan sudah ada berdasarkan ID
+                const exists = existingMessages.some(m => m.id === msgId);
                 
                 if (!exists) {
-                    // Pesan baru masuk sebagai unread
-                    await messageDB.save({ 
-                        ...msg, 
-                        id: msgId, 
-                        isRead: false, // Penting: set false untuk pesan baru
-                        message: msg.message || '(Kosong)',
+                    const newMessage = {
+                        id: msgId,
+                        from: msg.from,
                         subject: msg.subject || '(Tanpa Subjek)',
-                        account: currentAccount,
-                        created: msg.created || new Date().toISOString()
-                    });
+                        message: msg.message || '(Kosong)',
+                        created: msg.created,
+                        isRead: false,
+                        account: currentAccount
+                    };
+                    
+                    await messageDB.save(newMessage);
                     newMessagesCount++;
-                    log('New message saved as unread:', msgId);
-                } else {
-                    log('Message already exists:', msgId, 'read status:', exists.isRead);
                 }
             }
             
@@ -1254,7 +1282,6 @@ async function fetchInbox() {
                 playNotification();
             }
             
-            // Refresh tampilan dengan filter saat ini
             await loadCachedMessages();
         }
     } catch (e) {
@@ -1279,73 +1306,78 @@ function playNotification() {
 }
 
 // ========== RENDER MESSAGES ==========
-function renderMessages(messages) {
+function renderMessages(readMessages, unreadMessages, totalUnread) {
     const unreadContainer = document.getElementById('unreadList');
     const readContainer = document.getElementById('readList');
     
     let unreadHTML = '';
     let readHTML = '';
-    let unreadCount = 0;
 
-    if (!Array.isArray(messages)) {
-        log('Invalid messages data');
-        return;
+    // Render unread messages
+    if (unreadMessages && unreadMessages.length > 0) {
+        unreadMessages.forEach((msg) => {
+            if (!msg || !msg.id) return;
+            
+            const initial = msg.from ? msg.from.charAt(0).toUpperCase() : '?';
+            const timeDisplay = msg.created ? formatTime(msg.created) : '';
+            
+            const isEmailLong = msg.from && msg.from.length > 20;
+            const emailClass = isEmailLong ? 'email-long' : '';
+            const isStarred = starredMessages.has(msg.id);
+
+            unreadHTML += `
+                <div class="message-card unread" onclick="openMessage('${escapeString(msg.id)}')">
+                    <div class="msg-avatar">${escapeString(initial)}</div>
+                    <div class="msg-content">
+                        <div class="msg-header">
+                            <span class="msg-from ${emailClass}" title="${escapeString(msg.from || 'Unknown')}">${escapeString(msg.from || 'Unknown')}</span>
+                            <span class="msg-time">${escapeString(timeDisplay)}</span>
+                        </div>
+                        <div class="msg-subject" title="${escapeString(msg.subject || 'Tanpa Subjek')}">
+                            ${isStarred ? '<i class="bi bi-star-fill starred-icon"></i>' : ''}
+                            ${escapeString(msg.subject || '(Tanpa Subjek)')}
+                        </div>
+                        <div class="msg-snippet">${escapeString((msg.message || '').substring(0, 60))}${(msg.message || '').length > 60 ? '...' : ''}</div>
+                    </div>
+                </div>
+            `;
+        });
     }
 
-    log('Rendering messages total:', messages.length);
-    
-    // Reset containers
-    unreadContainer.innerHTML = '';
-    readContainer.innerHTML = '';
+    // Render read messages
+    if (readMessages && readMessages.length > 0) {
+        readMessages.forEach((msg) => {
+            if (!msg || !msg.id) return;
+            
+            const initial = msg.from ? msg.from.charAt(0).toUpperCase() : '?';
+            const timeDisplay = msg.created ? formatTime(msg.created) : '';
+            
+            const isEmailLong = msg.from && msg.from.length > 20;
+            const emailClass = isEmailLong ? 'email-long' : '';
+            const isStarred = starredMessages.has(msg.id);
 
-    messages.forEach((msg) => {
-        if (!msg || !msg.id) return;
-        
-        // Log untuk debugging
-        log(`Message ${msg.id} - isRead: ${msg.isRead}, from: ${msg.from}`);
-        
-        const initial = msg.from ? msg.from.charAt(0).toUpperCase() : '?';
-        const timeDisplay = msg.created ? formatDate(msg.created) : '';
-        
-        const isEmailLong = msg.from && msg.from.length > 20;
-        const emailClass = isEmailLong ? 'email-long' : '';
-        const isStarred = starredMessages.has(msg.id);
-
-        const html = `
-            <div class="message-card ${msg.isRead ? 'read' : 'unread'}" onclick="openMessage('${escapeString(msg.id)}')">
-                <div class="msg-avatar">${escapeString(initial)}</div>
-                <div class="msg-content">
-                    <div class="msg-header">
-                        <span class="msg-from ${emailClass}" title="${escapeString(msg.from || 'Unknown')}">${escapeString(msg.from || 'Unknown')}</span>
-                        <span class="msg-time">${escapeString(timeDisplay)}</span>
+            readHTML += `
+                <div class="message-card read" onclick="openMessage('${escapeString(msg.id)}')">
+                    <div class="msg-avatar">${escapeString(initial)}</div>
+                    <div class="msg-content">
+                        <div class="msg-header">
+                            <span class="msg-from ${emailClass}" title="${escapeString(msg.from || 'Unknown')}">${escapeString(msg.from || 'Unknown')}</span>
+                            <span class="msg-time">${escapeString(timeDisplay)}</span>
+                        </div>
+                        <div class="msg-subject" title="${escapeString(msg.subject || 'Tanpa Subjek)')}">
+                            ${isStarred ? '<i class="bi bi-star-fill starred-icon"></i>' : ''}
+                            ${escapeString(msg.subject || '(Tanpa Subjek)')}
+                        </div>
+                        <div class="msg-snippet">${escapeString((msg.message || '').substring(0, 60))}${(msg.message || '').length > 60 ? '...' : ''}</div>
                     </div>
-                    <div class="msg-subject" title="${escapeString(msg.subject || 'Tanpa Subjek')}">
-                        ${isStarred ? '<i class="bi bi-star-fill starred-icon"></i>' : ''}
-                        ${escapeString(msg.subject || '(Tanpa Subjek)')}
-                    </div>
-                    <div class="msg-snippet">${escapeString((msg.message || '').substring(0, 60))}${(msg.message || '').length > 60 ? '...' : ''}</div>
                 </div>
-            </div>
-        `;
+            `;
+        });
+    }
 
-        // Pisahkan berdasarkan status read/unread
-        if (msg.isRead) {
-            readHTML += html;
-        } else {
-            unreadHTML += html;
-            unreadCount++;
-        }
-    });
-
-    log(`Unread count: ${unreadCount}, Read count: ${messages.length - unreadCount}`);
-
-    // Set konten dengan empty state jika tidak ada
-    unreadContainer.innerHTML = unreadHTML || emptyState('updates');
-    readContainer.innerHTML = readHTML || emptyState('inbox');
-    
-    // Tambahkan pagination hanya untuk inbox jika ada pesan
-    if (readHTML) {
-        const paginationHTML = `
+    // Add pagination untuk inbox
+    if (readMessages && readMessages.length > 0) {
+        readHTML += `
             <div class="pagination-controls">
                 <button onclick="changePage('inbox', ${currentPage.inbox - 1})" ${currentPage.inbox <= 1 ? 'disabled' : ''}>
                     <i class="bi bi-chevron-left"></i>
@@ -1356,10 +1388,47 @@ function renderMessages(messages) {
                 </button>
             </div>
         `;
-        readContainer.innerHTML += paginationHTML;
     }
+
+    // Add pagination untuk updates
+    if (unreadMessages && unreadMessages.length > 0) {
+        unreadHTML += `
+            <div class="pagination-controls">
+                <button onclick="changePage('updates', ${currentPage.updates - 1})" ${currentPage.updates <= 1 ? 'disabled' : ''}>
+                    <i class="bi bi-chevron-left"></i>
+                </button>
+                <span>Halaman ${currentPage.updates} dari ${totalPages.updates}</span>
+                <button onclick="changePage('updates', ${currentPage.updates + 1})" ${currentPage.updates >= totalPages.updates ? 'disabled' : ''}>
+                    <i class="bi bi-chevron-right"></i>
+                </button>
+            </div>
+        `;
+    }
+
+    unreadContainer.innerHTML = unreadHTML || emptyState('updates');
+    readContainer.innerHTML = readHTML || emptyState('inbox');
     
-    updateBadge(unreadCount);
+    updateBadge(totalUnread);
+}
+
+function formatTime(dateString) {
+    try {
+        const date = new Date(dateString);
+        const now = new Date();
+        const diffMs = now - date;
+        const diffMins = Math.floor(diffMs / 60000);
+        const diffHours = Math.floor(diffMs / 3600000);
+        const diffDays = Math.floor(diffMs / 86400000);
+        
+        if (diffMins < 1) return 'Baru saja';
+        if (diffMins < 60) return `${diffMins} menit lalu`;
+        if (diffHours < 24) return `${diffHours} jam lalu`;
+        if (diffDays < 7) return `${diffDays} hari lalu`;
+        
+        return date.toLocaleDateString('id-ID');
+    } catch (e) {
+        return dateString;
+    }
 }
 
 function emptyState(type) {
@@ -1378,6 +1447,12 @@ async function changePage(view, newPage) {
     
     currentPage[view] = newPage;
     await loadCachedMessages();
+    
+    // Scroll ke atas
+    const container = document.getElementById(view === 'inbox' ? 'readList' : 'unreadList');
+    if (container) {
+        container.scrollTop = 0;
+    }
 }
 
 function updateBadge(count) {
@@ -1410,8 +1485,6 @@ async function openMessage(msgId) {
             return;
         }
 
-        log('Opening message:', msg.id, 'Current read status:', msg.isRead);
-
         trackEvent('message_read', { msgId: msgId });
 
         const initial = msg.from ? msg.from.charAt(0).toUpperCase() : '?';
@@ -1425,18 +1498,23 @@ async function openMessage(msgId) {
             <div class="meta-avatar">${escapeString(initial)}</div>
             <div class="meta-info">
                 <div class="meta-from ${emailClass}" title="${escapeString(msg.from || 'Unknown')}">${escapeString(msg.from || 'Unknown')}</div>
-                <div class="meta-time">${escapeString(formatDate(msg.created) || '')}</div>
+                <div class="meta-time">${escapeString(formatTime(msg.created))}</div>
             </div>
         `;
         
+        // Hapus star button yang sudah ada
         const modalActions = document.querySelector('.modal-actions');
         const existingStar = document.querySelector('.star-btn');
         if (existingStar) existingStar.remove();
         
+        // Tambah star button baru
         const starBtn = document.createElement('button');
         starBtn.className = `modal-btn star-btn ${starredMessages.has(msgId) ? 'active' : ''}`;
         starBtn.innerHTML = starredMessages.has(msgId) ? '<i class="bi bi-star-fill"></i>' : '<i class="bi bi-star"></i>';
-        starBtn.onclick = () => toggleStarred(msgId);
+        starBtn.onclick = (e) => {
+            e.stopPropagation();
+            toggleStarred(msgId);
+        };
         starBtn.title = starredMessages.has(msgId) ? 'Hapus dari favorit' : 'Tambah ke favorit';
         
         modalActions.insertBefore(starBtn, modalActions.firstChild);
@@ -1447,9 +1525,6 @@ async function openMessage(msgId) {
         if (!msg.isRead) {
             msg.isRead = true;
             await messageDB.save(msg);
-            log('Message marked as read:', msg.id);
-            
-            // Refresh tampilan
             await loadCachedMessages();
         }
     } catch (e) {
@@ -1481,19 +1556,11 @@ async function clearInbox() {
             try {
                 setButtonLoading('clearInboxBtn', true);
                 
-                const result = await messageDB.getAll({}, 1, 9999); // Ambil semua
-                const readMessages = result.items.filter(m => m.isRead);
+                // Hapus semua pesan yang sudah dibaca
+                await messageDB.deleteReadMessages();
                 
-                log('Deleting read messages:', readMessages.length);
-                
-                for (const msg of readMessages) {
-                    await messageDB.delete(msg.id);
-                    log('Deleted:', msg.id);
-                }
-                
-                // Refresh tampilan
                 await loadCachedMessages();
-                showToast(`${readMessages.length} pesan telah dihapus`, 'success');
+                showToast('Inbox telah dibersihkan', 'success');
             } catch (e) {
                 log('Clear inbox error:', e);
                 showToast('Gagal membersihkan inbox', 'error');
@@ -1527,7 +1594,6 @@ function openShareModal() {
 
 async function shareAsImage() {
     const captureCard = document.getElementById('capture-card');
-    const shareBtn = document.getElementById('shareImageBtn');
     
     setButtonLoading('shareImageBtn', true);
     showToast('Membuat gambar...', 'info');
@@ -1658,11 +1724,16 @@ function setupModalClickHandlers() {
         }
     });
     
-    document.getElementById('filterDate')?.addEventListener('change', function() {
-        document.getElementById('customDateRange').style.display = 
-            this.value === 'custom' ? 'block' : 'none';
-    });
+    // Date filter change handler
+    const dateSelect = document.getElementById('filterDate');
+    if (dateSelect) {
+        dateSelect.addEventListener('change', function() {
+            document.getElementById('customDateRange').style.display = 
+                this.value === 'custom' ? 'block' : 'none';
+        });
+    }
     
+    // Filter chips handler
     document.querySelectorAll('.filter-chip').forEach(chip => {
         chip.addEventListener('click', function() {
             document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
@@ -1676,21 +1747,25 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
         showGlobalLoading(true);
         
+        // Inisialisasi database
         await messageDB.init();
         initAnalytics();
         initSync();
         setupKeyboardShortcuts();
         
+        // Terapkan dark mode jika aktif
         if (darkMode) {
             document.body.classList.add('dark-mode');
         }
         
+        // Register service worker
         if ('serviceWorker' in navigator) {
             try {
                 await navigator.serviceWorker.register('/sw.js');
             } catch (swErr) {}
         }
 
+        // Load email
         if (currentEmail && isValidEmail(currentEmail)) {
             document.getElementById('emailAddress').innerText = currentEmail;
             await loadCachedMessages();
