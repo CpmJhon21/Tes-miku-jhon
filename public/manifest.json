@@ -1,18 +1,21 @@
 {
-    "name": "JHON PRODUCTION - TempMail - Email Sementara",
-    "short_name": "TempMail",
-    "description": "Secure Temporary Email by JHON PRODUCTION",
-    "start_url": "/",
-    "display": "standalone",
-    "background_color": "#F2F4F8",
-    "theme_color": "#111111",
-    "orientation": "portrait",
-    "icons": [
-        {
-            "src": "https://cdn-icons-png.flaticon.com/512/732/732200.png",
-            "sizes": "512x512",
-            "type": "image/png",
-            "purpose": "any maskable"
-        }
-    ]
+  "name": "JHON PRODUCTION - TempMail - Email Sementara by JHON PRODUCTION",
+  "short_name": "JhonTempMail",
+  "description": "Email sementara untuk melindungi privasi Anda dari spam",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F2F4F8",
+  "theme_color": "#F2F4F8",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/732/732200.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/732/732200.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
 }

@@ -18,7 +18,7 @@
     <div class="top-bar">
         <div class="app-name">TempMail</div>
         
-        <div class="user-avatar">
+        <div class="user-avatar" onclick="showAccountsModal()">
             <img src="https://cdn.odzre.my.id/cpz.jpg" alt="User">
         </div>
     </div>
@@ -56,11 +56,16 @@
         <section id="view-inbox" class="tab-view">
             <div class="section-header">
                 <h2>Riwayat Inbox</h2>
-                <button onclick="clearInbox()" class="trash-btn" id="clearInboxBtn" title="Hapus Semua Pesan">
-                    <i class="bi bi-trash3"></i>
-                </button>
+                <div style="display: flex; gap: 10px;">
+                    <button onclick="showFilterModal()" class="filter-btn" title="Filter Pesan">
+                        <i class="bi bi-funnel"></i>
+                    </button>
+                    <button onclick="clearInbox()" class="trash-btn" id="clearInboxBtn" title="Hapus Semua Pesan">
+                        <i class="bi bi-trash3"></i>
+                    </button>
+                </div>
             </div>
-            <div id="readList" class="message-list"></div>
+            <div id="readList" class="message-list virtual-scroll-container"></div>
             <!-- Loading Skeleton untuk Inbox -->
             <div id="readListSkeleton" class="skeleton-list" style="display: none;">
                 <div class="skeleton-card"></div>
@@ -73,8 +78,16 @@
         <section id="view-updates" class="tab-view">
             <div class="section-header">
                 <h2>Update Baru <span class="badge" id="badge-count" style="display:none">0</span></h2>
+                <div style="display: flex; gap: 10px;">
+                    <button onclick="showFilterModal()" class="filter-btn" title="Filter Pesan">
+                        <i class="bi bi-funnel"></i>
+                    </button>
+                    <button onclick="markAllAsRead()" class="mark-read-btn" title="Tandai Semua Dibaca">
+                        <i class="bi bi-check2-all"></i>
+                    </button>
+                </div>
             </div>
-            <div id="unreadList" class="message-list"></div>
+            <div id="unreadList" class="message-list virtual-scroll-container"></div>
             <!-- Loading Skeleton untuk Updates -->
             <div id="unreadListSkeleton" class="skeleton-list" style="display: none;">
                 <div class="skeleton-card"></div>
@@ -108,11 +121,40 @@
                 </ul>
             </div>
 
+            <div class="doc-card">
+                <h3><i class="bi bi-stars"></i> Fitur Baru</h3>
+                <ul>
+                    <li><strong>Multiple Accounts</strong> - Klik avatar untuk kelola beberapa email</li>
+                    <li><strong>Filter Pesan</strong> - Filter berdasarkan status, tanggal, dan pencarian</li>
+                    <li><strong>Mark All as Read</strong> - Tandai semua pesan telah dibaca</li>
+                    <li><strong>Favorit</strong> - Tandai pesan penting dengan bintang</li>
+                    <li><strong>Backup & Restore</strong> - Cadangkan data ke file JSON</li>
+                    <li><strong>Dark Mode</strong> - Tekan tombol D atau toggle di sini</li>
+                    <li><strong>Keyboard Shortcuts</strong> - Tekan ? untuk melihat shortcuts</li>
+                    <li><strong>Multi-tab Sync</strong> - Sinkronisasi antar tab browser</li>
+                    <li><strong>Virtual Scrolling</strong> - Performa lebih baik dengan ribuan pesan</li>
+                </ul>
+            </div>
+
             <div class="doc-card developer-card">
                 <h3>Developer Info</h3>
                 <p class="dev-name">JHON FORUM</p>
                 <p>Aplikasi ini dibuat untuk melindungi privasi user dari spam.</p>
-                <a href="https://whatsapp.com/channel/0029VaLiUSS5q08hPj5mcH0m" target="_blank" class="btn-whatsapp">
+                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                    <button onclick="showBackupModal()" class="btn-whatsapp" style="background: #4F46E5; margin:0; flex:1;">
+                        <i class="bi bi-database"></i> Backup
+                    </button>
+                    <button onclick="showShortcutsModal()" class="btn-whatsapp" style="background: #6B7280; margin:0; flex:1;">
+                        <i class="bi bi-keyboard"></i> Shortcuts
+                    </button>
+                    <button onclick="toggleDarkMode()" class="btn-whatsapp" style="background: #111111; margin:0; flex:1;">
+                        <i class="bi bi-moon-stars"></i> Dark Mode
+                    </button>
+                    <button onclick="showAnalytics()" class="btn-whatsapp" style="background: #059669; margin:0; flex:1;">
+                        <i class="bi bi-graph-up"></i> Analytics
+                    </button>
+                </div>
+                <a href="https://whatsapp.com/channel/0029VaLiUSS5q08hPj5mcH0m" target="_blank" class="btn-whatsapp" style="margin-top: 15px;">
                     <i class="bi bi-whatsapp"></i> Join Saluran Developer
                 </a>
             </div>
@@ -217,6 +259,216 @@
         </div>
     </div>
 
+    <!-- MODAL FILTER -->
+    <div id="filterModal" class="modal filter-modal">
+        <div class="modal-content filter-content">
+            <div class="modal-header">
+                <h3>Filter Pesan</h3>
+                <button onclick="closeModal('filterModal')" class="modal-btn close-btn">
+                    <i class="bi bi-x-lg"></i>
+                </button>
+            </div>
+            
+            <div class="filter-section">
+                <label>Status</label>
+                <div class="filter-options">
+                    <button class="filter-chip active" data-status="all">Semua</button>
+                    <button class="filter-chip" data-status="unread">Belum Dibaca</button>
+                    <button class="filter-chip" data-status="read">Sudah Dibaca</button>
+                </div>
+            </div>
+
+            <div class="filter-section">
+                <label>Tanggal</label>
+                <select id="filterDate" class="filter-select">
+                    <option value="all">Semua Waktu</option>
+                    <option value="today">Hari Ini</option>
+                    <option value="week">Minggu Ini</option>
+                    <option value="month">Bulan Ini</option>
+                    <option value="custom">Kustom</option>
+                </select>
+            </div>
+
+            <div id="customDateRange" style="display: none;">
+                <div class="filter-section">
+                    <label>Dari Tanggal</label>
+                    <input type="date" id="filterDateFrom" class="filter-input">
+                </div>
+                <div class="filter-section">
+                    <label>Sampai Tanggal</label>
+                    <input type="date" id="filterDateTo" class="filter-input">
+                </div>
+            </div>
+
+            <div class="filter-section">
+                <label>Cari Pesan</label>
+                <input type="text" id="filterSearch" class="filter-input" placeholder="Ketik kata kunci...">
+            </div>
+
+            <div class="filter-actions">
+                <button onclick="applyFilter()" class="filter-apply">Terapkan Filter</button>
+                <button onclick="resetFilter()" class="filter-reset">Reset</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL BACKUP/RESTORE -->
+    <div id="backupModal" class="modal backup-modal">
+        <div class="modal-content backup-content">
+            <div class="modal-header">
+                <h3>Backup & Restore</h3>
+                <button onclick="closeModal('backupModal')" class="modal-btn close-btn">
+                    <i class="bi bi-x-lg"></i>
+                </button>
+            </div>
+
+            <div class="backup-stats">
+                <div class="stat-item">
+                    <span class="stat-label">Total Pesan</span>
+                    <span class="stat-value" id="backupTotalMsg">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Ukuran Data</span>
+                    <span class="stat-value" id="backupSize">0 KB</span>
+                </div>
+            </div>
+
+            <div class="backup-actions">
+                <button onclick="exportBackup()" class="backup-btn export">
+                    <i class="bi bi-download"></i>
+                    Export Backup
+                </button>
+                <button onclick="document.getElementById('restoreFile').click()" class="backup-btn import">
+                    <i class="bi bi-upload"></i>
+                    Import Backup
+                </button>
+                <input type="file" id="restoreFile" accept=".json" style="display: none;" onchange="importBackup(this)">
+            </div>
+
+            <div class="backup-info">
+                <p><i class="bi bi-info-circle"></i> Backup mencakup semua pesan dan pengaturan Anda</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL MULTI ACCOUNT -->
+    <div id="accountsModal" class="modal accounts-modal">
+        <div class="modal-content accounts-content">
+            <div class="modal-header">
+                <h3>Multiple Accounts</h3>
+                <button onclick="closeModal('accountsModal')" class="modal-btn close-btn">
+                    <i class="bi bi-x-lg"></i>
+                </button>
+            </div>
+
+            <div class="accounts-list" id="accountsList">
+                <!-- Accounts will be listed here -->
+            </div>
+
+            <button onclick="showAddAccountModal()" class="add-account-btn">
+                <i class="bi bi-plus-circle"></i> Tambah Account Baru
+            </button>
+        </div>
+    </div>
+
+    <!-- MODAL KEYBOARD SHORTCUTS -->
+    <div id="shortcutsModal" class="modal shortcuts-modal">
+        <div class="modal-content shortcuts-content">
+            <div class="modal-header">
+                <h3>Keyboard Shortcuts</h3>
+                <button onclick="closeModal('shortcutsModal')" class="modal-btn close-btn">
+                    <i class="bi bi-x-lg"></i>
+                </button>
+            </div>
+
+            <div class="shortcuts-list">
+                <div class="shortcut-item">
+                    <span class="shortcut-key">G</span>
+                    <span class="shortcut-desc">Generate email baru</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">R</span>
+                    <span class="shortcut-desc">Refresh inbox</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">C</span>
+                    <span class="shortcut-desc">Copy email</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">F</span>
+                    <span class="shortcut-desc">Filter pesan</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">/</span>
+                    <span class="shortcut-desc">Fokus pencarian</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">M</span>
+                    <span class="shortcut-desc">Mark all as read</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">D</span>
+                    <span class="shortcut-desc">Toggle dark mode</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">1-4</span>
+                    <span class="shortcut-desc">Switch tabs</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">ESC</span>
+                    <span class="shortcut-desc">Close modal</span>
+                </div>
+                <div class="shortcut-item">
+                    <span class="shortcut-key">?</span>
+                    <span class="shortcut-desc">Tampilkan shortcuts</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ADD ACCOUNT MODAL -->
+    <div id="addAccountModal" class="modal add-account-modal">
+        <div class="modal-content add-account-content">
+            <div class="modal-header">
+                <h3>Tambah Account</h3>
+                <button onclick="closeModal('addAccountModal')" class="modal-btn close-btn">
+                    <i class="bi bi-x-lg"></i>
+                </button>
+            </div>
+
+            <div class="add-account-form">
+                <div class="form-group">
+                    <label>Nama Account</label>
+                    <input type="text" id="newAccountName" class="form-input" placeholder="Contoh: Account 1">
+                </div>
+                <div class="form-group">
+                    <label>Email</label>
+                    <input type="email" id="newAccountEmail" class="form-input" placeholder="atau biarkan kosong untuk generate">
+                </div>
+            </div>
+
+            <div class="add-account-actions">
+                <button onclick="addNewAccount()" class="add-account-confirm">Tambah Account</button>
+                <button onclick="closeModal('addAccountModal')" class="add-account-cancel">Batal</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL ERROR/CONFIRMATION CUSTOM -->
+    <div id="confirmModal" class="modal confirm-modal" style="display: none;">
+        <div class="modal-content confirm-content">
+            <div class="confirm-icon">
+                <i class="bi bi-question-circle"></i>
+            </div>
+            <h3 id="confirmTitle">Konfirmasi</h3>
+            <p id="confirmMessage">Apakah Anda yakin?</p>
+            <div class="confirm-buttons">
+                <button onclick="confirmAction(false)" class="confirm-btn cancel">Batal</button>
+                <button onclick="confirmAction(true)" class="confirm-btn ok">Ya</button>
+            </div>
+        </div>
+    </div>
+
     <!-- CAPTURE CONTAINER UNTUK GENERATE GAMBAR (HIDDEN) -->
     <div id="capture-container" style="position: fixed; left: -9999px; top: 0;">
         <div id="capture-card" class="capture-card">
@@ -249,21 +501,6 @@
             <div class="capture-footer">
                 <div>Temporary Email | JHON FORUM</div>
                 <div class="capture-time">© 2024 TempMail - Privasi Terjaga</div>
-            </div>
-        </div>
-    </div>
-
-    <!-- MODAL ERROR/CONFIRMATION CUSTOM -->
-    <div id="confirmModal" class="modal confirm-modal" style="display: none;">
-        <div class="modal-content confirm-content">
-            <div class="confirm-icon">
-                <i class="bi bi-question-circle"></i>
-            </div>
-            <h3 id="confirmTitle">Konfirmasi</h3>
-            <p id="confirmMessage">Apakah Anda yakin?</p>
-            <div class="confirm-buttons">
-                <button onclick="confirmAction(false)" class="confirm-btn cancel">Batal</button>
-                <button onclick="confirmAction(true)" class="confirm-btn ok">Ya</button>
             </div>
         </div>
     </div>

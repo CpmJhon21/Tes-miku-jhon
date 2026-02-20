@@ -1,12 +1,20 @@
 // ========== KONFIGURASI ==========
 const CONFIG = {
     DB_NAME: 'jhonMailDB',
-    DB_VERSION: 1,
+    DB_VERSION: 2,
     STORE_NAME: 'messages',
-    REFRESH_INTERVAL: 10, // detik
-    REQUEST_TIMEOUT: 10000, // 10 detik
+    STORE_ACCOUNTS: 'accounts',
+    STORE_SETTINGS: 'settings',
+    STORE_STARRED: 'starred',
+    REFRESH_INTERVAL: 10,
+    REQUEST_TIMEOUT: 10000,
     MAX_RETRY: 3,
-    DEBUG: true
+    DEBUG: true,
+    VIRTUAL_SCROLL_ITEM_HEIGHT: 90,
+    VIRTUAL_SCROLL_BUFFER: 5,
+    PAGINATION_PAGE_SIZE: 20,
+    SYNC_INTERVAL: 30000,
+    MAX_STORAGE_SIZE: 50 * 1024 * 1024
 };
 
 // ========== STATE MANAGEMENT ==========
@@ -15,8 +23,35 @@ let db = null;
 let autoRefreshInterval = null;
 let refreshTimeLeft = CONFIG.REFRESH_INTERVAL;
 let pendingConfirmation = null;
+let currentFilter = {
+    status: 'all',
+    date: 'all',
+    search: '',
+    dateFrom: null,
+    dateTo: null
+};
+let currentPage = {
+    inbox: 1,
+    updates: 1
+};
+let totalPages = {
+    inbox: 1,
+    updates: 1
+};
+let syncInterval = null;
+let currentAccount = localStorage.getItem('jhon_current_account') || 'default';
+let accounts = JSON.parse(localStorage.getItem('jhon_accounts') || '{"default": {"name": "Default", "email": null}}');
+let starredMessages = new Set(JSON.parse(localStorage.getItem('jhon_starred') || '[]'));
+let darkMode = localStorage.getItem('jhon_darkmode') === 'true';
+let analytics = {
+    messagesReceived: 0,
+    messagesRead: 0,
+    emailsGenerated: 0,
+    lastSync: null,
+    storageUsed: 0
+};
 
-// ========== CLASS MessageDB - PERBAIKAN ERROR HANDLING ==========
+// ========== CLASS MessageDB ==========
 class MessageDB {
     constructor(dbName, storeName) {
         this.dbName = dbName;
@@ -31,16 +66,29 @@ class MessageDB {
                 
                 request.onupgradeneeded = (e) => {
                     const db = e.target.result;
+                    
                     if (!db.objectStoreNames.contains(this.storeName)) {
-                        db.createObjectStore(this.storeName, { keyPath: 'id' });
-                        log('Database store created');
+                        const messageStore = db.createObjectStore(this.storeName, { keyPath: 'id' });
+                        messageStore.createIndex('account', 'account', { unique: false });
+                        messageStore.createIndex('created', 'created', { unique: false });
+                        messageStore.createIndex('isRead', 'isRead', { unique: false });
                     }
+                    
+                    if (!db.objectStoreNames.contains(CONFIG.STORE_ACCOUNTS)) {
+                        const accountStore = db.createObjectStore(CONFIG.STORE_ACCOUNTS, { keyPath: 'id' });
+                        accountStore.createIndex('email', 'email', { unique: true });
+                    }
+                    
+                    if (!db.objectStoreNames.contains(CONFIG.STORE_SETTINGS)) {
+                        db.createObjectStore(CONFIG.STORE_SETTINGS);
+                    }
+                    
+                    log('Database upgraded to version', CONFIG.DB_VERSION);
                 };
                 
                 request.onsuccess = (e) => { 
                     this.db = e.target.result;
                     
-                    // Handle connection closed unexpectedly
                     this.db.onclose = () => {
                         log('Database connection closed');
                         this.db = null;
@@ -79,10 +127,14 @@ class MessageDB {
                 const tx = this.db.transaction(this.storeName, 'readwrite');
                 const store = tx.objectStore(this.storeName);
                 
+                message.account = currentAccount;
+                message.starred = starredMessages.has(message.id);
+                
                 const request = store.put(message);
                 
                 request.onsuccess = () => {
                     log('Message saved:', message.id);
+                    this.updateAnalytics();
                     resolve();
                 };
                 
@@ -90,9 +142,6 @@ class MessageDB {
                     log('Save failed:', e.target.error);
                     reject(new Error('Failed to save message: ' + e.target.error));
                 };
-                
-                tx.oncomplete = () => resolve();
-                tx.onerror = (e) => reject(new Error('Transaction failed: ' + e.target.error));
             });
         } catch (e) {
             log('Save error:', e);
@@ -100,7 +149,7 @@ class MessageDB {
         }
     }
 
-    async getAll() {
+    async getAll(filter = {}, page = 1, pageSize = CONFIG.PAGINATION_PAGE_SIZE) {
         try {
             await this.ensureConnection();
             
@@ -110,7 +159,22 @@ class MessageDB {
                 const request = store.getAll();
                 
                 request.onsuccess = () => {
-                    resolve(request.result || []);
+                    let messages = request.result || [];
+                    
+                    messages = messages.filter(m => m.account === currentAccount);
+                    messages = this.applyFilters(messages, filter);
+                    messages.sort((a, b) => new Date(b.created) - new Date(a.created));
+                    
+                    const total = messages.length;
+                    const start = (page - 1) * pageSize;
+                    const end = start + pageSize;
+                    
+                    resolve({
+                        items: messages.slice(start, end),
+                        total: total,
+                        page: page,
+                        totalPages: Math.ceil(total / pageSize)
+                    });
                 };
                 
                 request.onerror = (e) => {
@@ -120,7 +184,72 @@ class MessageDB {
             });
         } catch (e) {
             log('Get all error:', e);
-            return [];
+            return { items: [], total: 0, page: 1, totalPages: 1 };
+        }
+    }
+
+    applyFilters(messages, filter) {
+        return messages.filter(msg => {
+            if (filter.status === 'unread' && msg.isRead) return false;
+            if (filter.status === 'read' && !msg.isRead) return false;
+            
+            if (filter.date !== 'all') {
+                const msgDate = new Date(msg.created);
+                const today = new Date();
+                
+                switch(filter.date) {
+                    case 'today':
+                        if (msgDate.toDateString() !== today.toDateString()) return false;
+                        break;
+                    case 'week':
+                        const weekAgo = new Date(today.setDate(today.getDate() - 7));
+                        if (msgDate < weekAgo) return false;
+                        break;
+                    case 'month':
+                        const monthAgo = new Date(today.setMonth(today.getMonth() - 1));
+                        if (msgDate < monthAgo) return false;
+                        break;
+                    case 'custom':
+                        if (filter.dateFrom && msgDate < new Date(filter.dateFrom)) return false;
+                        if (filter.dateTo && msgDate > new Date(filter.dateTo)) return false;
+                        break;
+                }
+            }
+            
+            if (filter.search) {
+                const searchLower = filter.search.toLowerCase();
+                const matches = 
+                    (msg.from && msg.from.toLowerCase().includes(searchLower)) ||
+                    (msg.subject && msg.subject.toLowerCase().includes(searchLower)) ||
+                    (msg.message && msg.message.toLowerCase().includes(searchLower));
+                
+                if (!matches) return false;
+            }
+            
+            return true;
+        });
+    }
+
+    async getById(id) {
+        try {
+            await this.ensureConnection();
+            
+            return new Promise((resolve, reject) => {
+                const tx = this.db.transaction(this.storeName, 'readonly');
+                const store = tx.objectStore(this.storeName);
+                const request = store.get(id);
+                
+                request.onsuccess = () => {
+                    resolve(request.result);
+                };
+                
+                request.onerror = (e) => {
+                    reject(new Error('Failed to get message: ' + e.target.error));
+                };
+            });
+        } catch (e) {
+            log('Get by id error:', e);
+            return null;
         }
     }
 
@@ -131,15 +260,21 @@ class MessageDB {
             return new Promise((resolve, reject) => {
                 const tx = this.db.transaction(this.storeName, 'readwrite');
                 const store = tx.objectStore(this.storeName);
-                const request = store.clear();
                 
-                request.onsuccess = () => {
-                    log('Database cleared');
-                    resolve();
+                const request = store.openCursor();
+                request.onsuccess = (e) => {
+                    const cursor = e.target.result;
+                    if (cursor) {
+                        if (cursor.value.account === currentAccount) {
+                            cursor.delete();
+                        }
+                        cursor.continue();
+                    } else {
+                        resolve();
+                    }
                 };
                 
                 request.onerror = (e) => {
-                    log('Clear failed:', e.target.error);
                     reject(new Error('Failed to clear database: ' + e.target.error));
                 };
             });
@@ -159,6 +294,8 @@ class MessageDB {
                 const request = store.delete(id);
                 
                 request.onsuccess = () => {
+                    starredMessages.delete(id);
+                    localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
                     log('Message deleted:', id);
                     resolve();
                 };
@@ -173,10 +310,29 @@ class MessageDB {
             throw e;
         }
     }
+
+    async updateAnalytics() {
+        try {
+            const result = await this.getAll();
+            analytics.messagesReceived = result.total;
+            analytics.messagesRead = result.items.filter(m => m.isRead).length;
+            
+            const serialized = JSON.stringify(result.items);
+            analytics.storageUsed = new Blob([serialized]).size;
+            
+            this.saveAnalytics();
+        } catch (e) {
+            log('Update analytics error:', e);
+        }
+    }
+
+    saveAnalytics() {
+        localStorage.setItem('jhon_analytics', JSON.stringify(analytics));
+    }
 }
 
 // Inisialisasi database
-const messageDB = new MessageDB(CONFIG.DB_NAME, CONFIG.STORE_NAME);
+const messageDB = new MessageDB(CONFIG.DB_NAME, CONFIG.STORE_MESSAGES || CONFIG.STORE_NAME);
 
 // ========== UTILITY FUNCTIONS ==========
 function log(...args) {
@@ -230,7 +386,29 @@ function setButtonLoading(buttonId, loading = true) {
     }
 }
 
-// Custom confirm dialog
+function openModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (modal) {
+        modal.classList.add('show');
+        document.body.classList.add('modal-open');
+    }
+}
+
+function closeModal(modalId) {
+    const modal = document.getElementById(modalId);
+    if (modal) {
+        modal.classList.remove('show');
+        document.body.classList.remove('modal-open');
+    }
+}
+
+function closeAllModals() {
+    document.querySelectorAll('.modal.show').forEach(modal => {
+        modal.classList.remove('show');
+    });
+    document.body.classList.remove('modal-open');
+}
+
 function showConfirm(title, message, onConfirm) {
     const modal = document.getElementById('confirmModal');
     document.getElementById('confirmTitle').innerText = title;
@@ -253,7 +431,6 @@ function confirmAction(confirmed) {
     pendingConfirmation = null;
 }
 
-// ========== ERROR HANDLING NETWORK ==========
 async function fetchWithTimeout(resource, options = {}) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
@@ -271,7 +448,6 @@ async function fetchWithTimeout(resource, options = {}) {
         
         const data = await response.json();
         
-        // Validasi response structure
         if (!data || typeof data !== 'object') {
             throw new Error('Invalid response format');
         }
@@ -287,7 +463,6 @@ async function fetchWithTimeout(resource, options = {}) {
     }
 }
 
-// ========== VALIDASI INPUT ==========
 function isValidMessageId(id) {
     return id && typeof id === 'string' && id.length > 0;
 }
@@ -297,65 +472,508 @@ function isValidEmail(email) {
     return email && typeof email === 'string' && emailRegex.test(email);
 }
 
-// ========== INISIALISASI ==========
-document.addEventListener('DOMContentLoaded', async () => {
-    try {
-        showGlobalLoading(true);
-        
-        await messageDB.init();
-        log('Database ready');
-        
-        if ('serviceWorker' in navigator) {
-            try {
-                await navigator.serviceWorker.register('/sw.js');
-                log('Service Worker registered');
-            } catch (swErr) {
-                log('Service Worker registration failed:', swErr);
-            }
-        }
+function escapeString(str) {
+    if (!str) return '';
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}
 
-        if (currentEmail && isValidEmail(currentEmail)) {
-            document.getElementById('emailAddress').innerText = currentEmail;
-            await loadCachedMessages();
-            fetchInbox();
-        } else {
-            // Hapus email tidak valid
-            localStorage.removeItem('jhon_mail');
-            currentEmail = null;
-            generateNewEmail();
-        }
-        
-        startAutoRefresh();
-        setupModalClickHandlers();
-        
-    } catch (e) {
-        log('Initialization error:', e);
-        showToast('Gagal inisialisasi aplikasi', 'error');
-    } finally {
-        showGlobalLoading(false);
+// ========== SYNC FUNCTIONS ==========
+function initSync() {
+    if (syncInterval) {
+        clearInterval(syncInterval);
     }
-});
-
-// ========== MODAL HANDLERS ==========
-function setupModalClickHandlers() {
-    const msgModal = document.getElementById('msgModal');
-    const shareModal = document.getElementById('shareMsgModal');
-    const confirmModal = document.getElementById('confirmModal');
     
-    [msgModal, shareModal, confirmModal].forEach(modal => {
-        if (modal) {
-            modal.addEventListener('click', function(event) {
-                if (event.target === modal) {
-                    closeModal(modal.id);
-                }
-            });
+    syncInterval = setInterval(async () => {
+        await syncWithOtherTabs();
+    }, CONFIG.SYNC_INTERVAL);
+    
+    window.addEventListener('storage', (e) => {
+        if (e.key === 'jhon_sync_trigger') {
+            handleSyncFromOtherTab();
         }
     });
 }
 
-// ========== AUTO REFRESH - PERBAIKAN MEMORY LEAK ==========
+async function syncWithOtherTabs() {
+    try {
+        const result = await messageDB.getAll();
+        const data = {
+            timestamp: Date.now(),
+            messages: result.items,
+            accounts: accounts,
+            currentAccount: currentAccount,
+            starred: [...starredMessages]
+        };
+        
+        localStorage.setItem('jhon_sync_data', JSON.stringify(data));
+        localStorage.setItem('jhon_sync_trigger', Date.now().toString());
+        
+        analytics.lastSync = new Date().toISOString();
+        messageDB.saveAnalytics();
+    } catch (e) {
+        log('Sync error:', e);
+    }
+}
+
+async function handleSyncFromOtherTab() {
+    try {
+        const syncData = localStorage.getItem('jhon_sync_data');
+        if (!syncData) return;
+        
+        const data = JSON.parse(syncData);
+        
+        if (data.timestamp > (analytics.lastSync ? new Date(analytics.lastSync).getTime() : 0)) {
+            accounts = data.accounts;
+            localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
+            
+            if (data.currentAccount !== currentAccount) {
+                currentAccount = data.currentAccount;
+                localStorage.setItem('jhon_current_account', currentAccount);
+                await loadCachedMessages();
+            }
+            
+            starredMessages = new Set(data.starred);
+            localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+        }
+    } catch (e) {
+        log('Sync handling error:', e);
+    }
+}
+
+// ========== BACKUP & RESTORE ==========
+async function exportBackup() {
+    try {
+        showGlobalLoading(true);
+        
+        const result = await messageDB.getAll();
+        const backup = {
+            version: CONFIG.DB_VERSION,
+            timestamp: new Date().toISOString(),
+            data: {
+                messages: result.items,
+                accounts: accounts,
+                starred: [...starredMessages],
+                analytics: analytics,
+                settings: {
+                    darkMode: darkMode,
+                    refreshInterval: CONFIG.REFRESH_INTERVAL
+                }
+            }
+        };
+        
+        const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `tempmail-backup-${new Date().toISOString().split('T')[0]}.json`;
+        a.click();
+        
+        URL.revokeObjectURL(url);
+        showToast('Backup berhasil dibuat', 'success');
+        closeModal('backupModal');
+    } catch (e) {
+        log('Export backup error:', e);
+        showToast('Gagal membuat backup', 'error');
+    } finally {
+        showGlobalLoading(false);
+    }
+}
+
+async function importBackup(input) {
+    const file = input.files[0];
+    if (!file) return;
+    
+    try {
+        showGlobalLoading(true);
+        
+        const text = await file.text();
+        const backup = JSON.parse(text);
+        
+        if (!backup.version || !backup.data) {
+            throw new Error('Format backup tidak valid');
+        }
+        
+        if (backup.data.messages) {
+            await messageDB.clear();
+            for (const msg of backup.data.messages) {
+                await messageDB.save(msg);
+            }
+        }
+        
+        if (backup.data.accounts) {
+            accounts = backup.data.accounts;
+            localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
+        }
+        
+        if (backup.data.starred) {
+            starredMessages = new Set(backup.data.starred);
+            localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+        }
+        
+        if (backup.data.settings) {
+            darkMode = backup.data.settings.darkMode;
+            if (darkMode) document.body.classList.add('dark-mode');
+            else document.body.classList.remove('dark-mode');
+            localStorage.setItem('jhon_darkmode', darkMode);
+        }
+        
+        await loadCachedMessages();
+        showToast('Backup berhasil direstore', 'success');
+        closeModal('backupModal');
+    } catch (e) {
+        log('Import backup error:', e);
+        showToast('Gagal merestore backup: ' + e.message, 'error');
+    } finally {
+        showGlobalLoading(false);
+        input.value = '';
+    }
+}
+
+function showBackupModal() {
+    const totalMsg = document.getElementById('backupTotalMsg');
+    const backupSize = document.getElementById('backupSize');
+    
+    totalMsg.textContent = analytics.messagesReceived || 0;
+    
+    const size = analytics.storageUsed || 0;
+    if (size < 1024) {
+        backupSize.textContent = size + ' B';
+    } else if (size < 1024 * 1024) {
+        backupSize.textContent = (size / 1024).toFixed(2) + ' KB';
+    } else {
+        backupSize.textContent = (size / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+    
+    openModal('backupModal');
+}
+
+// ========== MULTIPLE ACCOUNTS ==========
+async function switchAccount(accountId) {
+    currentAccount = accountId;
+    localStorage.setItem('jhon_current_account', accountId);
+    
+    currentEmail = accounts[accountId].email;
+    if (currentEmail) {
+        localStorage.setItem('jhon_mail', currentEmail);
+        document.getElementById('emailAddress').innerText = currentEmail;
+    }
+    
+    await loadCachedMessages();
+    showToast(`Beralih ke ${accounts[accountId].name}`, 'success');
+    closeModal('accountsModal');
+}
+
+function showAccountsModal() {
+    const accountsList = document.getElementById('accountsList');
+    let html = '';
+    
+    Object.keys(accounts).forEach(accountId => {
+        const account = accounts[accountId];
+        const isActive = accountId === currentAccount;
+        
+        html += `
+            <div class="account-item ${isActive ? 'active' : ''}" onclick="switchAccount('${accountId}')">
+                <div class="account-avatar">${account.name.charAt(0).toUpperCase()}</div>
+                <div class="account-info">
+                    <div class="account-name">${account.name}</div>
+                    <div class="account-email">${account.email || 'Belum ada email'}</div>
+                </div>
+                ${isActive ? '<i class="bi bi-check-circle-fill account-check"></i>' : ''}
+            </div>
+        `;
+    });
+    
+    accountsList.innerHTML = html || '<div class="empty-placeholder">Belum ada account</div>';
+    openModal('accountsModal');
+}
+
+function showAddAccountModal() {
+    document.getElementById('newAccountName').value = '';
+    document.getElementById('newAccountEmail').value = '';
+    openModal('addAccountModal');
+}
+
+async function addNewAccount() {
+    const name = document.getElementById('newAccountName').value.trim();
+    const email = document.getElementById('newAccountEmail').value.trim();
+    
+    if (!name) {
+        showToast('Nama account harus diisi', 'error');
+        return;
+    }
+    
+    const accountId = 'account_' + Date.now();
+    
+    accounts[accountId] = {
+        name: name,
+        email: email || null
+    };
+    
+    localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
+    
+    if (email) {
+        currentEmail = email;
+        currentAccount = accountId;
+        localStorage.setItem('jhon_mail', email);
+        localStorage.setItem('jhon_current_account', accountId);
+        document.getElementById('emailAddress').innerText = email;
+        await loadCachedMessages();
+    }
+    
+    closeModal('addAccountModal');
+    showAccountsModal();
+    showToast('Account berhasil ditambahkan', 'success');
+}
+
+// ========== DARK MODE ==========
+function toggleDarkMode() {
+    darkMode = !darkMode;
+    
+    if (darkMode) {
+        document.body.classList.add('dark-mode');
+    } else {
+        document.body.classList.remove('dark-mode');
+    }
+    
+    localStorage.setItem('jhon_darkmode', darkMode);
+    showToast(darkMode ? 'Dark mode aktif' : 'Light mode aktif', 'success');
+}
+
+// ========== FILTER FUNCTIONS ==========
+function showFilterModal() {
+    document.querySelectorAll('.filter-chip').forEach(chip => {
+        if (chip.dataset.status === currentFilter.status) {
+            chip.classList.add('active');
+        } else {
+            chip.classList.remove('active');
+        }
+    });
+    
+    document.getElementById('filterDate').value = currentFilter.date;
+    document.getElementById('filterSearch').value = currentFilter.search;
+    document.getElementById('filterDateFrom').value = currentFilter.dateFrom || '';
+    document.getElementById('filterDateTo').value = currentFilter.dateTo || '';
+    
+    document.getElementById('customDateRange').style.display = 
+        currentFilter.date === 'custom' ? 'block' : 'none';
+    
+    openModal('filterModal');
+}
+
+function applyFilter() {
+    const activeChip = document.querySelector('.filter-chip.active');
+    currentFilter.status = activeChip ? activeChip.dataset.status : 'all';
+    
+    currentFilter.date = document.getElementById('filterDate').value;
+    
+    if (currentFilter.date === 'custom') {
+        currentFilter.dateFrom = document.getElementById('filterDateFrom').value;
+        currentFilter.dateTo = document.getElementById('filterDateTo').value;
+    } else {
+        currentFilter.dateFrom = null;
+        currentFilter.dateTo = null;
+    }
+    
+    currentFilter.search = document.getElementById('filterSearch').value;
+    
+    closeModal('filterModal');
+    loadCachedMessages();
+    showToast('Filter diterapkan', 'success');
+}
+
+function resetFilter() {
+    currentFilter = {
+        status: 'all',
+        date: 'all',
+        search: '',
+        dateFrom: null,
+        dateTo: null
+    };
+    
+    closeModal('filterModal');
+    loadCachedMessages();
+    showToast('Filter direset', 'success');
+}
+
+// ========== MARK ALL AS READ ==========
+async function markAllAsRead() {
+    try {
+        showGlobalLoading(true);
+        
+        const result = await messageDB.getAll();
+        const unreadMessages = result.items.filter(m => !m.isRead);
+        
+        for (const msg of unreadMessages) {
+            msg.isRead = true;
+            await messageDB.save(msg);
+        }
+        
+        await loadCachedMessages();
+        showToast('Semua pesan ditandai telah dibaca', 'success');
+    } catch (e) {
+        log('Mark all as read error:', e);
+        showToast('Gagal menandai pesan', 'error');
+    } finally {
+        showGlobalLoading(false);
+    }
+}
+
+// ========== STARRED MESSAGES ==========
+async function toggleStarred(msgId) {
+    try {
+        if (starredMessages.has(msgId)) {
+            starredMessages.delete(msgId);
+            showToast('Dihapus dari favorit', 'info');
+        } else {
+            starredMessages.add(msgId);
+            showToast('Ditambahkan ke favorit', 'success');
+        }
+        
+        localStorage.setItem('jhon_starred', JSON.stringify([...starredMessages]));
+        
+        const msg = await messageDB.getById(msgId);
+        if (msg) {
+            msg.starred = starredMessages.has(msgId);
+            await messageDB.save(msg);
+        }
+        
+        await loadCachedMessages();
+    } catch (e) {
+        log('Toggle starred error:', e);
+        showToast('Gagal mengupdate favorit', 'error');
+    }
+}
+
+// ========== KEYBOARD SHORTCUTS ==========
+function setupKeyboardShortcuts() {
+    document.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+            return;
+        }
+        
+        const key = e.key.toLowerCase();
+        
+        switch(key) {
+            case 'g':
+                e.preventDefault();
+                confirmNewEmail();
+                break;
+            case 'r':
+                e.preventDefault();
+                fetchInbox();
+                break;
+            case 'c':
+                e.preventDefault();
+                copyEmail();
+                break;
+            case 'f':
+                e.preventDefault();
+                showFilterModal();
+                break;
+            case '/':
+                e.preventDefault();
+                document.getElementById('filterSearch')?.focus();
+                break;
+            case 'm':
+                e.preventDefault();
+                markAllAsRead();
+                break;
+            case 'd':
+                e.preventDefault();
+                toggleDarkMode();
+                break;
+            case '1':
+                e.preventDefault();
+                switchTab('view-home', document.querySelector('.nav-item:first-child'));
+                break;
+            case '2':
+                e.preventDefault();
+                switchTab('view-inbox', document.querySelectorAll('.nav-item')[1]);
+                break;
+            case '3':
+                e.preventDefault();
+                switchTab('view-updates', document.querySelectorAll('.nav-item')[3]);
+                break;
+            case '4':
+                e.preventDefault();
+                switchTab('view-docs', document.querySelectorAll('.nav-item')[4]);
+                break;
+            case '?':
+                e.preventDefault();
+                showShortcutsModal();
+                break;
+            case 'escape':
+                closeAllModals();
+                break;
+        }
+    });
+}
+
+function showShortcutsModal() {
+    openModal('shortcutsModal');
+}
+
+// ========== ANALYTICS ==========
+function initAnalytics() {
+    const saved = localStorage.getItem('jhon_analytics');
+    if (saved) {
+        analytics = JSON.parse(saved);
+    }
+    
+    trackEvent('app_loaded');
+}
+
+function trackEvent(eventName, data = {}) {
+    const event = {
+        name: eventName,
+        timestamp: new Date().toISOString(),
+        data: data,
+        account: currentAccount
+    };
+    
+    const events = JSON.parse(localStorage.getItem('jhon_events') || '[]');
+    events.push(event);
+    
+    if (events.length > 100) {
+        events.shift();
+    }
+    
+    localStorage.setItem('jhon_events', JSON.stringify(events));
+    
+    switch(eventName) {
+        case 'email_generated':
+            analytics.emailsGenerated++;
+            break;
+        case 'message_received':
+            analytics.messagesReceived++;
+            break;
+        case 'message_read':
+            analytics.messagesRead++;
+            break;
+    }
+    
+    messageDB.saveAnalytics();
+}
+
+function showAnalytics() {
+    const stats = `
+📊 ANALYTICS TempMail
+════════════════════
+📨 Pesan diterima: ${analytics.messagesReceived}
+👁️ Pesan dibaca: ${analytics.messagesRead}
+🔢 Email digenerate: ${analytics.emailsGenerated}
+⏱️ Terakhir sync: ${analytics.lastSync ? new Date(analytics.lastSync).toLocaleString() : 'Belum'}
+💾 Storage used: ${(analytics.storageUsed / 1024).toFixed(2)} KB
+    `;
+    
+    alert(stats);
+}
+
+// ========== AUTO REFRESH ==========
 function startAutoRefresh() {
-    stopAutoRefresh(); // Bersihkan interval lama
+    stopAutoRefresh();
     
     refreshTimeLeft = CONFIG.REFRESH_INTERVAL;
     updateTimerDisplay();
@@ -369,15 +987,12 @@ function startAutoRefresh() {
             refreshTimeLeft = CONFIG.REFRESH_INTERVAL;
         }
     }, 1000);
-    
-    log('Auto refresh started');
 }
 
 function stopAutoRefresh() {
     if (autoRefreshInterval) {
         clearInterval(autoRefreshInterval);
         autoRefreshInterval = null;
-        log('Auto refresh stopped');
     }
 }
 
@@ -416,30 +1031,30 @@ async function generateNewEmail() {
     setButtonLoading('newEmailFab', true);
     
     try {
-        // Hentikan auto refresh sementara
         stopAutoRefresh();
         
         const data = await fetchWithTimeout('/api?action=generate');
         
         if (data.success && data.result && data.result.email) {
-            // Bersihkan database lama
             await messageDB.clear();
             
             currentEmail = data.result.email;
+            
+            accounts[currentAccount].email = currentEmail;
+            localStorage.setItem('jhon_accounts', JSON.stringify(accounts));
             localStorage.setItem('jhon_mail', currentEmail);
+            
             emailDisplay.innerText = currentEmail;
             
-            // Reset tampilan
+            trackEvent('email_generated');
+            
             document.getElementById('unreadList').innerHTML = emptyState('updates');
             document.getElementById('readList').innerHTML = emptyState('inbox');
             updateBadge(0);
             
-            // Kembali ke home
             switchTab('view-home', document.querySelector('.nav-item:first-child'));
-            
             showToast('Email baru berhasil dibuat', 'success');
             
-            // Restart auto refresh
             refreshTimeLeft = CONFIG.REFRESH_INTERVAL;
             startAutoRefresh();
         } else {
@@ -457,8 +1072,9 @@ async function generateNewEmail() {
 // ========== MESSAGE OPERATIONS ==========
 async function loadCachedMessages() {
     try {
-        const messages = await messageDB.getAll();
-        renderMessages(messages);
+        const result = await messageDB.getAll(currentFilter, currentPage.inbox);
+        totalPages.inbox = result.totalPages;
+        renderMessages(result.items);
     } catch (e) {
         log('Load cached messages error:', e);
         showToast('Gagal memuat pesan', 'error');
@@ -476,11 +1092,11 @@ async function fetchInbox() {
 
         if (data.success && data.result && Array.isArray(data.result.inbox)) {
             const serverMessages = data.result.inbox;
-            const existingMessages = await messageDB.getAll();
+            const result = await messageDB.getAll();
+            const existingMessages = result.items;
             let newMessagesCount = 0;
             
             for (const msg of serverMessages) {
-                // Validasi message structure
                 if (!msg.from || !msg.created) continue;
                 
                 const msgId = `${msg.created}_${msg.from}`.replace(/\s/g, '');
@@ -492,15 +1108,16 @@ async function fetchInbox() {
                         id: msgId, 
                         isRead: false,
                         message: msg.message || '(Kosong)',
-                        subject: msg.subject || '(Tanpa Subjek)'
+                        subject: msg.subject || '(Tanpa Subjek)',
+                        account: currentAccount
                     });
                     newMessagesCount++;
                 }
             }
             
             if (newMessagesCount > 0) {
+                trackEvent('messages_received', { count: newMessagesCount });
                 showToast(`${newMessagesCount} pesan baru diterima`, 'success');
-                // Play notification sound jika ada
                 playNotification();
             }
             
@@ -517,19 +1134,14 @@ async function fetchInbox() {
     }
 }
 
-// Play notification (jika browser mengizinkan)
 function playNotification() {
     try {
-        // Hanya play jika tab tidak aktif? Atau biarkan user memilih
         if (document.visibilityState === 'visible') {
-            // Bisa tambahkan audio beep atau vibrate
             if (navigator.vibrate) {
                 navigator.vibrate(200);
             }
         }
-    } catch (e) {
-        // Ignore
-    }
+    } catch (e) {}
 }
 
 // ========== RENDER MESSAGES ==========
@@ -541,42 +1153,32 @@ function renderMessages(messages) {
     let readHTML = '';
     let unreadCount = 0;
 
-    // Validasi messages
     if (!Array.isArray(messages)) {
-        log('Invalid messages data');
         return;
     }
 
-    // Sort by date descending
-    messages.sort((a, b) => {
-        try {
-            return new Date(b.created) - new Date(a.created);
-        } catch {
-            return 0;
-        }
-    });
-
     messages.forEach((msg) => {
-        // Validasi setiap message
         if (!msg || !msg.id) return;
         
         const initial = msg.from ? msg.from.charAt(0).toUpperCase() : '?';
         const timeDisplay = msg.created ? (msg.created.split(' ')[1] || msg.created) : '';
         
-        // Deteksi email panjang
         const isEmailLong = msg.from && msg.from.length > 20;
         const emailClass = isEmailLong ? 'email-long' : '';
-        const emailTitle = msg.from || 'Unknown';
+        const isStarred = starredMessages.has(msg.id);
 
         const html = `
             <div class="message-card ${msg.isRead ? 'read' : 'unread'}" onclick="openMessage('${escapeString(msg.id)}')">
                 <div class="msg-avatar">${escapeString(initial)}</div>
                 <div class="msg-content">
                     <div class="msg-header">
-                        <span class="msg-from ${emailClass}" title="${escapeString(emailTitle)}">${escapeString(msg.from || 'Unknown')}</span>
+                        <span class="msg-from ${emailClass}" title="${escapeString(msg.from || 'Unknown')}">${escapeString(msg.from || 'Unknown')}</span>
                         <span class="msg-time">${escapeString(timeDisplay)}</span>
                     </div>
-                    <div class="msg-subject" title="${escapeString(msg.subject || 'Tanpa Subjek')}">${escapeString(msg.subject || '(Tanpa Subjek)')}</div>
+                    <div class="msg-subject" title="${escapeString(msg.subject || 'Tanpa Subjek')}">
+                        ${isStarred ? '<i class="bi bi-star-fill starred-icon"></i>' : ''}
+                        ${escapeString(msg.subject || '(Tanpa Subjek)')}
+                    </div>
                     <div class="msg-snippet">${escapeString((msg.message || '').substring(0, 60))}${(msg.message || '').length > 60 ? '...' : ''}</div>
                 </div>
             </div>
@@ -590,37 +1192,78 @@ function renderMessages(messages) {
         }
     });
 
+    const paginationHTML = `
+        <div class="pagination-controls">
+            <button onclick="changePage('inbox', ${currentPage.inbox - 1})" ${currentPage.inbox <= 1 ? 'disabled' : ''}>
+                <i class="bi bi-chevron-left"></i>
+            </button>
+            <span>Halaman ${currentPage.inbox} dari ${totalPages.inbox}</span>
+            <button onclick="changePage('inbox', ${currentPage.inbox + 1})" ${currentPage.inbox >= totalPages.inbox ? 'disabled' : ''}>
+                <i class="bi bi-chevron-right"></i>
+            </button>
+        </div>
+    `;
+
     unreadContainer.innerHTML = unreadHTML || emptyState('updates');
     readContainer.innerHTML = readHTML || emptyState('inbox');
+    
+    if (readHTML) {
+        readContainer.innerHTML += paginationHTML;
+    }
     
     updateBadge(unreadCount);
 }
 
-// Escape string untuk mencegah XSS
-function escapeString(str) {
-    if (!str) return '';
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
+function emptyState(type) {
+    const icon = type === 'updates' ? 'bi-bell-slash' : 'bi-inbox';
+    const text = type === 'updates' ? 'Belum ada pesan baru.' : 'Belum ada pesan terbaca.';
+    return `
+        <div class="empty-placeholder">
+            <i class="bi ${icon}"></i>
+            <p>${text}</p>
+        </div>
+    `;
+}
+
+async function changePage(view, newPage) {
+    if (newPage < 1 || newPage > totalPages[view]) return;
+    
+    currentPage[view] = newPage;
+    await loadCachedMessages();
+}
+
+function updateBadge(count) {
+    const badge = document.getElementById('badge-count');
+    const dot = document.getElementById('nav-dot');
+    
+    if (count > 0) {
+        badge.innerText = count;
+        badge.style.display = 'inline-block';
+        dot.style.display = 'block';
+        document.title = `(${count}) TempMail`;
+    } else {
+        badge.style.display = 'none';
+        dot.style.display = 'none';
+        document.title = 'TempMail';
+    }
 }
 
 // ========== OPEN MESSAGE ==========
 async function openMessage(msgId) {
     if (!isValidMessageId(msgId)) {
-        log('Invalid message ID');
         return;
     }
     
     try {
-        const messages = await messageDB.getAll();
-        const msg = messages.find(m => m.id === msgId);
+        const msg = await messageDB.getById(msgId);
         
         if (!msg) {
             showToast('Pesan tidak ditemukan', 'error');
             return;
         }
 
-        // Data untuk Modal
+        trackEvent('message_read', { msgId: msgId });
+
         const initial = msg.from ? msg.from.charAt(0).toUpperCase() : '?';
         document.getElementById('modalSubject').innerText = msg.subject || '(Tanpa Subjek)';
         document.getElementById('modalBody').innerText = msg.message || '(Kosong)';
@@ -636,11 +1279,20 @@ async function openMessage(msgId) {
             </div>
         `;
         
-        const modal = document.getElementById('msgModal');
-        modal.classList.add('show');
-        document.body.classList.add('modal-open');
+        const modalActions = document.querySelector('.modal-actions');
+        const existingStar = document.querySelector('.star-btn');
+        if (existingStar) existingStar.remove();
+        
+        const starBtn = document.createElement('button');
+        starBtn.className = `modal-btn star-btn ${starredMessages.has(msgId) ? 'active' : ''}`;
+        starBtn.innerHTML = starredMessages.has(msgId) ? '<i class="bi bi-star-fill"></i>' : '<i class="bi bi-star"></i>';
+        starBtn.onclick = () => toggleStarred(msgId);
+        starBtn.title = starredMessages.has(msgId) ? 'Hapus dari favorit' : 'Tambah ke favorit';
+        
+        modalActions.insertBefore(starBtn, modalActions.firstChild);
+        
+        openModal('msgModal');
 
-        // Tandai sebagai sudah dibaca
         if (!msg.isRead) {
             msg.isRead = true;
             await messageDB.save(msg);
@@ -650,46 +1302,6 @@ async function openMessage(msgId) {
         log('Open message error:', e);
         showToast('Gagal membuka pesan', 'error');
     }
-}
-
-// ========== CLOSE MODAL ==========
-function closeModal(modalId) {
-    const modal = document.getElementById(modalId);
-    if (modal) {
-        modal.classList.remove('show');
-        document.body.classList.remove('modal-open');
-    }
-}
-
-// ========== UPDATE BADGE ==========
-function updateBadge(count) {
-    const badge = document.getElementById('badge-count');
-    const dot = document.getElementById('nav-dot');
-    
-    if (count > 0) {
-        badge.innerText = count;
-        badge.style.display = 'inline-block';
-        dot.style.display = 'block';
-        
-        // Update title
-        document.title = `(${count}) TempMail`;
-    } else {
-        badge.style.display = 'none';
-        dot.style.display = 'none';
-        document.title = 'TempMail';
-    }
-}
-
-// ========== EMPTY STATE ==========
-function emptyState(type) {
-    const icon = type === 'updates' ? 'bi-bell-slash' : 'bi-inbox';
-    const text = type === 'updates' ? 'Belum ada pesan baru.' : 'Belum ada pesan terbaca.';
-    return `
-        <div class="empty-placeholder">
-            <i class="bi ${icon}"></i>
-            <p>${text}</p>
-        </div>
-    `;
 }
 
 // ========== COPY EMAIL ==========
@@ -715,8 +1327,8 @@ async function clearInbox() {
             try {
                 setButtonLoading('clearInboxBtn', true);
                 
-                const messages = await messageDB.getAll();
-                const readMessages = messages.filter(m => m.isRead);
+                const result = await messageDB.getAll();
+                const readMessages = result.items.filter(m => m.isRead);
                 
                 for (const msg of readMessages) {
                     await messageDB.delete(msg.id);
@@ -736,7 +1348,6 @@ async function clearInbox() {
 
 // ========== SHARE FUNCTIONS ==========
 function openShareModal() {
-    // Update data capture
     const capEmail = document.getElementById('capEmail');
     const capSubject = document.getElementById('capSubject');
     const capMsg = document.getElementById('capMsg');
@@ -749,14 +1360,10 @@ function openShareModal() {
     if (subjectElement) capSubject.innerText = subjectElement.innerText;
     if (bodyElement) capMsg.innerText = bodyElement.innerText;
     
-    // Tutup modal pesan
     closeModal('msgModal');
     
-    // Buka modal share
     setTimeout(() => {
-        const modal = document.getElementById('shareMsgModal');
-        modal.classList.add('show');
-        document.body.classList.add('modal-open');
+        openModal('shareMsgModal');
     }, 300);
 }
 
@@ -768,7 +1375,6 @@ async function shareAsImage() {
     showToast('Membuat gambar...', 'info');
     
     try {
-        // Pastikan elemen visible
         captureCard.style.position = 'fixed';
         captureCard.style.left = '50%';
         captureCard.style.top = '50%';
@@ -783,7 +1389,6 @@ async function shareAsImage() {
             useCORS: true
         });
         
-        // Kembalikan ke posisi semula
         captureCard.style.position = '';
         captureCard.style.left = '';
         captureCard.style.top = '';
@@ -792,7 +1397,6 @@ async function shareAsImage() {
         
         const image = canvas.toDataURL('image/png');
         
-        // Cek support Web Share API
         if (navigator.share && navigator.canShare) {
             try {
                 const blob = await (await fetch(image)).blob();
@@ -808,7 +1412,6 @@ async function shareAsImage() {
                     downloadImage(image);
                 }
             } catch (shareErr) {
-                log('Share error:', shareErr);
                 downloadImage(image);
             }
         } else {
@@ -876,23 +1479,96 @@ function copyMessageText() {
     }
 }
 
+// ========== MODAL HANDLERS ==========
+function setupModalClickHandlers() {
+    const msgModal = document.getElementById('msgModal');
+    const shareModal = document.getElementById('shareMsgModal');
+    const confirmModal = document.getElementById('confirmModal');
+    const filterModal = document.getElementById('filterModal');
+    const backupModal = document.getElementById('backupModal');
+    const accountsModal = document.getElementById('accountsModal');
+    const shortcutsModal = document.getElementById('shortcutsModal');
+    const addAccountModal = document.getElementById('addAccountModal');
+    
+    [msgModal, shareModal, confirmModal, filterModal, backupModal, accountsModal, shortcutsModal, addAccountModal].forEach(modal => {
+        if (modal) {
+            modal.addEventListener('click', function(event) {
+                if (event.target === modal) {
+                    closeModal(modal.id);
+                }
+            });
+        }
+    });
+    
+    document.getElementById('filterDate')?.addEventListener('change', function() {
+        document.getElementById('customDateRange').style.display = 
+            this.value === 'custom' ? 'block' : 'none';
+    });
+    
+    document.querySelectorAll('.filter-chip').forEach(chip => {
+        chip.addEventListener('click', function() {
+            document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
+            this.classList.add('active');
+        });
+    });
+}
+
+// ========== INITIALIZATION ==========
+document.addEventListener('DOMContentLoaded', async () => {
+    try {
+        showGlobalLoading(true);
+        
+        await messageDB.init();
+        initAnalytics();
+        initSync();
+        setupKeyboardShortcuts();
+        
+        if (darkMode) {
+            document.body.classList.add('dark-mode');
+        }
+        
+        if ('serviceWorker' in navigator) {
+            try {
+                await navigator.serviceWorker.register('/sw.js');
+            } catch (swErr) {}
+        }
+
+        if (currentEmail && isValidEmail(currentEmail)) {
+            document.getElementById('emailAddress').innerText = currentEmail;
+            await loadCachedMessages();
+            fetchInbox();
+        } else {
+            localStorage.removeItem('jhon_mail');
+            currentEmail = null;
+            generateNewEmail();
+        }
+        
+        startAutoRefresh();
+        setupModalClickHandlers();
+        
+    } catch (e) {
+        log('Initialization error:', e);
+        showToast('Gagal inisialisasi aplikasi', 'error');
+    } finally {
+        showGlobalLoading(false);
+    }
+});
+
 // ========== CLEANUP ==========
 window.addEventListener('beforeunload', function() {
     stopAutoRefresh();
-    
-    // Close database connection
+    if (syncInterval) {
+        clearInterval(syncInterval);
+    }
     if (messageDB && messageDB.db) {
         messageDB.db.close();
     }
 });
 
-// Global error handler
 window.addEventListener('error', (event) => {
     log('Global error:', event.error);
-    showToast('Terjadi kesalahan', 'error');
 });
 
 window.addEventListener('unhandledrejection', (event) => {
     log('Unhandled rejection:', event.reason);
-    showToast('Terjadi kesalahan', 'error');
 });
