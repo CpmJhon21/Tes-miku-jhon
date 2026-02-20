@@ -1,0 +1,18 @@
+{
+    "name": "JHON PRODUCTION - TempMail - Email Sementara",
+    "short_name": "TempMail",
+    "description": "Secure Temporary Email by JHON PRODUCTION",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#F2F4F8",
+    "theme_color": "#111111",
+    "orientation": "portrait",
+    "icons": [
+        {
+            "src": "https://cdn-icons-png.flaticon.com/512/732/732200.png",
+            "sizes": "512x512",
+            "type": "image/png",
+            "purpose": "any maskable"
+        }
+    ]
+}
