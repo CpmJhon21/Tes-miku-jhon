@@ -1522,7 +1522,30 @@ function copyMessageText() {
         const modalFrom = document.querySelector('.meta-from')?.innerText || 'Unknown';
         const modalTime = document.querySelector('.meta-time')?.innerText || '';
         
-        const text = `*${modalSubject}*\nDari: ${modalFrom}\nWaktu: ${modalTime}\n\n${modalBody}`;
+        const text = `📊 *Jhon-TempMail*
+════════════════════
+         *PESAN TERKIRIM*
+════════════════════
+📨 *Pesan diterima:* 
+
+\`${modalSubject}\`
+════════════════════
+📧 *Email Dari:* 
+
+\`${modalFrom}\`
+════════════════════
+⏱️ *Waktu:* 
+
+\`${modalTime}\`
+════════════════════
+🗓️ *Tanggal bulan tahun:*
+
+\`${new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}\`
+════════════════════
+💾 *Dikirim via:* 
+
+\`TempMail - JHON FORUM\`
+════════════════════`;
         
         navigator.clipboard.writeText(text).then(() => {
             showToast('Teks disalin!', 'success');
